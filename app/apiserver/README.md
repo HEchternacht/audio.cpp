@@ -89,8 +89,32 @@ ignores.
 | `requeue_on_start` | `true` | Re-queue jobs that were waiting when the server died |
 | `requeue_max_age_hours` | `24` | Older waiting jobs are marked interrupted instead |
 | `unload_after_cancel` | `true` | Drop the session after a cancel rather than reusing it |
+| `unload_after_error` | `true` | Drop it after a failed run too. A run that throws unwinds past the session's own cleanup, so its graph arenas stay resident and the next job fails on a smaller allocation |
+| `unload_after_job` | `false` | Drop it after every job. Costs one reload; worth it where peak VRAM sits close to the card |
 | `progress_interval_ms` | `250` | Throttle for progress events |
 | `max_event_subscribers` | `64` | Each SSE stream costs a connection thread |
+
+### Fitting a long take on a small card
+
+yue2's acoustic stage solves the take in chunks of `nar_context` tokens, and
+prefills the AR over each chunk to condition it. At the 24576 default a
+full-length song is a single chunk, whose AR prefix-state cache alone asks for
+about 2 GiB on top of the weights — measured peak 5.7 GiB of a 6.1 GiB card, so
+the allocation fails and the job reports `failed to allocate Yue2 AR
+prefix-state cache`. It is not a leak and not specific to this server: the same
+request fails the same way on `audiocpp_server`.
+
+Pass `nar_context` in the request options to split the take instead:
+
+```json
+{"model": "yue2-3b-q8", "request": {"text": "...", "options": {
+  "style": "j-rock, anime opening", "nar_context": "4096"}}}
+```
+
+Measured on an RTX 4050 (6 GB): the same prompt that failed at the default
+rendered 2:47 of audio with `nar_context: 4096`, peaking at 5.5 GiB. Lower it
+further if the card is smaller; the chunk is `(nar_context - prefix - 3) / 2`
+tokens, so halving it roughly halves the acoustic stage's peak.
 
 `--host`, `--port`, `--workers`, `--data-dir` and `--cors-origins` override the
 file.

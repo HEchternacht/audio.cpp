@@ -165,6 +165,10 @@ runtime::ModelCliInterface yue2_cli_interface() {
         {"seed", "int", "Generation seed.", false, "0"},
         {"cfg_scale", "float", "Classifier-free guidance scale.", false, "1.0", "0.0", "20.0"},
         {"num_inference_steps", "int", "NAR ODE steps.", false, "10", "1"},
+        {"nar_context", "int",
+         "Acoustic window in tokens. Caps peak VRAM: the default renders a whole take as one "
+         "chunk, lower values split it into several that each fit a smaller card.",
+         false, "24576", "256"},
     };
     out.session_options = {
         {"yue2.model_gguf", "string", "Yue2 main AR/NAR component GGUF file relative to the model root.", false, "yue2-3b-q8_0.gguf"},

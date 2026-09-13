@@ -75,6 +75,16 @@ void apply_options(
     if (out.generation.ode_steps <= 0) {
         throw std::runtime_error("Yue2 num_inference_steps must be positive");
     }
+    // The NAR window, and the only bound on peak VRAM for a long take. It sets
+    // the chunk the acoustic stage solves at once, and with it the length of the
+    // AR prefill that feeds each chunk -- at the 24576 default a full-length
+    // song is one chunk, whose prefix-state cache alone is about 2 GiB. Lowering
+    // it splits the same take into several chunks that each fit.
+    out.generation.context =
+        runtime::parse_positive_i64_option(options, {"nar_context"}, out.generation.context);
+    if (out.generation.context < 256) {
+        throw std::runtime_error("Yue2 nar_context must be at least 256");
+    }
     auto apply_sampling = [&options](Yue2SamplingConfig & sampling, const std::string & prefix) {
         if (const auto value = runtime::parse_finite_float_option(options, {prefix + "_temperature"})) {
             sampling.temperature = *value;
