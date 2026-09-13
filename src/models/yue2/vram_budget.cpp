@@ -29,6 +29,18 @@ int64_t yue2_max_tokens_for(int64_t free_bytes, int64_t headroom_bytes,
     return static_cast<int64_t>(static_cast<double>(tokens) * scale);
 }
 
+int64_t yue2_generated_tokens_for(int64_t cache_tokens, int64_t prefix_tokens,
+                                  int64_t decode_caches, int64_t downstream_weight) {
+    if (cache_tokens <= 0 || decode_caches <= 0 || downstream_weight < 0 || prefix_tokens < 0) {
+        return 0;
+    }
+    const int64_t left = cache_tokens - prefix_tokens * decode_caches;
+    if (left <= 0) {
+        return 0;
+    }
+    return left / (decode_caches + downstream_weight);
+}
+
 Yue2StageWindow yue2_stage_window(const std::string & name, int64_t requested, int64_t cap) {
     Yue2StageWindow out;
     out.tokens = requested;
@@ -111,7 +123,26 @@ int main() {
 
     {
         const auto window = yue2_stage_window("semantic_max_tokens", 9000, 4772);
-        record("yue2_stage_window", "9000 requested, 4772 fits",
+        // 10000 cache tokens, a 2600-token plan+lyrics prefix, no guidance, the
+    // acoustic stage charging 3: (10000 - 2600) / 4.
+    record("yue2_generated_tokens_for", "10000 cache tokens, 2600 prefix, 1 decode cache, 3 downstream",
+           std::to_string(yue2_generated_tokens_for(10000, 2600, 1, 3)), "1850");
+    // The same budget under guidance: the prefix is held twice and every
+    // generated token costs two caches plus the acoustic three.
+    record("yue2_generated_tokens_for", "same, guidance (2 decode caches)",
+           std::to_string(yue2_generated_tokens_for(10000, 2600, 2, 3)), "960");
+    record("yue2_generated_tokens_for", "no prefix",
+           std::to_string(yue2_generated_tokens_for(10000, 0, 1, 3)), "2500");
+    record("yue2_generated_tokens_for", "downstream free",
+           std::to_string(yue2_generated_tokens_for(10000, 2600, 1, 0)), "7400");
+    record("yue2_generated_tokens_for", "prefix alone exhausts the budget",
+           std::to_string(yue2_generated_tokens_for(2000, 2600, 1, 3)), "0");
+    record("yue2_generated_tokens_for", "unmeasurable budget",
+           std::to_string(yue2_generated_tokens_for(0, 100, 1, 3)), "0");
+    record("yue2_generated_tokens_for", "zero decode caches",
+           std::to_string(yue2_generated_tokens_for(10000, 0, 0, 3)), "0");
+
+    record("yue2_stage_window", "9000 requested, 4772 fits",
                std::to_string(window.tokens) + " clamped=" + (window.clamped ? "1" : "0"),
                "4772 clamped=1");
         record("yue2_stage_window", "note text", window.note,

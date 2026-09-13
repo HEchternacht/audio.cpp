@@ -187,16 +187,13 @@ public:
                                    vram_budget_scale);
     }
 
-    // Applies a stage's budget in place and records why, so a short take is
-    // explained rather than mysterious.
-    void fit_stage(const char * name, int64_t & window, int64_t sequences, int64_t cost_weight) {
-        const int64_t free_bytes = free_device_bytes();
-        const auto fitted = yue2_stage_window(name, window, stage_token_cap(sequences, cost_weight));
-        // One line per stage, on stderr rather than the timing log, because the
-        // number that decides whether a run survives should be in the server log
-        // without anyone having to turn tracing on.
-        std::fprintf(stderr, "[yue2] %s: %lld free MiB, %lld sequences, window %lld -> %lld\n", name,
-                     static_cast<long long>(free_bytes >> 20), static_cast<long long>(sequences),
+    // Applies a cap in place and records why, so a short take is explained
+    // rather than mysterious. One line per stage, on stderr rather than the
+    // timing log, because the number that decides whether a run survives should
+    // be in the server log without anyone having to turn tracing on.
+    void apply_cap(const char * name, int64_t & window, int64_t cap, const std::string & detail) {
+        const auto fitted = yue2_stage_window(name, window, cap);
+        std::fprintf(stderr, "[yue2] %s: %s, window %lld -> %lld\n", name, detail.c_str(),
                      static_cast<long long>(window), static_cast<long long>(fitted.tokens));
         if (!fitted.clamped) {
             return;
@@ -204,6 +201,13 @@ public:
         window = fitted.tokens;
         budget_notes.push_back(fitted.note);
         engine::debug::timing_log_scalar(std::string("yue2.budget.") + name, fitted.tokens);
+    }
+
+    void fit_stage(const char * name, int64_t & window, int64_t sequences, int64_t cost_weight) {
+        const int64_t free_bytes = free_device_bytes();
+        apply_cap(name, window, stage_token_cap(sequences, cost_weight),
+                  std::to_string(free_bytes >> 20) + " free MiB, " + std::to_string(sequences) +
+                      " sequences");
     }
 
     Yue2SemanticResult generate_semantic(const Yue2Request & request, Yue2Plan plan,
@@ -256,11 +260,24 @@ public:
         // doing it. Budgeting both together here is what lets the acoustic stage
         // run in one piece, which is the only way it sounds right.
         const int64_t decode_caches = request_guidance_scale(request) == 1.0F ? 1 : 2;
-        fit_stage("semantic_max_tokens", semantic.max_tokens, 1,
-                  decode_caches + kYue2PrefixStateCostWeight);
-        semantic.max_tokens =
-            std::max<int64_t>(semantic.min_tokens,
-                              semantic.max_tokens - static_cast<int64_t>(out.plan.prefix.size()));
+        // The prefix is in this cache too, and under cot=full it is not small:
+        // the planner's score is thousands of tokens long and every one of them
+        // is prefilled before the first musical token is sampled. It costs a
+        // decode cache each and nothing downstream -- the acoustic stage is
+        // given the music, never the score -- so charging it at the generated
+        // rate is what turned cot=full into eight seconds of audio while cot=off
+        // ran for minutes on the same card.
+        const int64_t prefix_tokens =
+            std::max<int64_t>(static_cast<int64_t>(out.plan.prefix.size()),
+                              static_cast<int64_t>(neg.size()));
+        const int64_t free_bytes = free_device_bytes();
+        const int64_t cap = yue2_generated_tokens_for(stage_token_cap(1, kYue2DecodeCostWeight),
+                                                      prefix_tokens, decode_caches,
+                                                      kYue2PrefixStateCostWeight);
+        apply_cap("semantic_max_tokens", semantic.max_tokens, cap,
+                  std::to_string(free_bytes >> 20) + " free MiB, " + std::to_string(prefix_tokens) +
+                      " prefix tokens, " + std::to_string(decode_caches) + " decode caches");
+        semantic.max_tokens = std::max<int64_t>(semantic.min_tokens, semantic.max_tokens);
         out.tokens = ar->generate_cfg(
             out.plan.prefix,
             neg,

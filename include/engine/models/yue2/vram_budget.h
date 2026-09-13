@@ -55,6 +55,24 @@ int64_t yue2_max_tokens_for(int64_t free_bytes, int64_t headroom_bytes,
                             int64_t bytes_per_token, int64_t sequences,
                             int64_t cost_weight = 1, double scale = 1.0);
 
+// How many tokens a stage may *generate*, given that a prefix already sits in
+// the same cache and a later stage will pay again for every token generated.
+//
+// The two costs are not the same and must not be charged the same. A prefix
+// token costs one cache per decoding sequence and nothing afterwards: the
+// acoustic stage never sees the planner's score or the lyrics. A generated
+// token costs those same caches *and* its share of the acoustic prefix-state
+// graph. Charging the prefix at the generated rate is what makes a run with a
+// long plan collapse to nothing -- `cot=full` writes a score of thousands of
+// tokens, and at four caches a token that plan alone can exhaust a budget that
+// would comfortably have held it at one.
+//
+// `cache_tokens` is the budget in plain single-cache token units, i.e.
+// yue2_max_tokens_for(..., cost_weight = 1). Returns 0 when the prefix alone
+// does not fit, or when the budget could not be measured.
+int64_t yue2_generated_tokens_for(int64_t cache_tokens, int64_t prefix_tokens,
+                                  int64_t decode_caches, int64_t downstream_weight);
+
 // The window a stage should actually use, and why. `cap` of 0 means the free
 // memory could not be measured, in which case `requested` is honoured: a run
 // that might have fit is better than one refused on a guess.

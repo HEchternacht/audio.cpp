@@ -117,6 +117,16 @@ The server handles this in two layers, and neither needs configuring:
    `oom_retries` (default 2) bounds this, so the worst case is a budget
    quartered rather than an endless loop. Each retry is logged.
 
+The semantic budget is split between the prefix and the tokens the stage will
+generate, because they do not cost the same. A prefix token costs a decode
+cache and nothing after that -- the acoustic stage is handed the music, never
+the planner's score -- while a generated token costs that cache and its share
+of the acoustic prefix-state graph. This matters most under `cot=full`, where
+the planner writes a score of hundreds to thousands of tokens: charged at the
+generated rate, that plan alone could exhaust a budget that holds it easily at
+the prefix rate, and the take collapsed to the 200-token floor (eight seconds)
+while the same request at `cot=off` ran for minutes.
+
 Windows that were shortened appear in the job's `result` output under `notes`,
 so a short take on a small card says why rather than looking like the model
 stopped early.
