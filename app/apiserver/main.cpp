@@ -87,6 +87,8 @@ The "api" config block, with its defaults:
     "requeue_on_start": true,
     "requeue_max_age_hours": 24,
     "unload_after_cancel": true,
+    "unload_after_error": true,
+    "unload_after_job": false,
     "progress_interval_ms": 250,
     "max_event_subscribers": 64
   }

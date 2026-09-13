@@ -47,6 +47,19 @@ struct ApiConfig {
     // that a partially advanced KV cache never contaminates the next job.
     bool unload_after_cancel = true;
 
+    // A run that threw leaves its session holding the graph arenas it had
+    // already allocated, so on a card with little headroom every later job on
+    // that model fails the same way -- most visibly as a CUDA OOM reported as
+    // "failed to allocate ... graph". Dropping the session is the only reliable
+    // way to hand the next job a clean device.
+    bool unload_after_error = true;
+
+    // Unload after *every* job, not just the unhappy ones. Off by default,
+    // because it costs a reload per job. Worth turning on where peak VRAM is
+    // close to the card: a completed run leaves a few hundred MiB resident, and
+    // a few of those in a row are the difference between fitting and not.
+    bool unload_after_job = false;
+
     size_t max_event_subscribers = 64;
 };
 

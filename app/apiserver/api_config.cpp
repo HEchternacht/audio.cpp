@@ -46,6 +46,10 @@ ApiConfig apply_api_overrides(ApiConfig defaults, const Value & document) {
     config.requeue_on_start = engine::io::json::optional_bool(*api, "requeue_on_start", config.requeue_on_start);
     config.unload_after_cancel =
         engine::io::json::optional_bool(*api, "unload_after_cancel", config.unload_after_cancel);
+    config.unload_after_error =
+        engine::io::json::optional_bool(*api, "unload_after_error", config.unload_after_error);
+    config.unload_after_job =
+        engine::io::json::optional_bool(*api, "unload_after_job", config.unload_after_job);
     config.max_event_subscribers = static_cast<size_t>(optional_i64_at(
         *api, "max_event_subscribers", static_cast<int64_t>(config.max_event_subscribers)));
 
@@ -143,6 +147,10 @@ int main() {
         record("apply/default_max_queued", "{}", std::to_string(config.max_queued), "256");
         record("apply/default_unload_after_cancel", "{}",
                config.unload_after_cancel ? "true" : "false", "true");
+        record("apply/default_unload_after_error", "{}",
+               config.unload_after_error ? "true" : "false", "true");
+        record("apply/default_unload_after_job", "{}",
+               config.unload_after_job ? "true" : "false", "false");
     });
 
     guarded("apply_api_overrides/each_field", [] {
@@ -160,6 +168,8 @@ int main() {
             "requeue_max_age_hours": 6,
             "requeue_on_start": false,
             "unload_after_cancel": false,
+            "unload_after_error": false,
+            "unload_after_job": true,
             "max_event_subscribers": 8,
             "data_dir": "C:/elsewhere"
         }})");
@@ -175,6 +185,8 @@ int main() {
         record("apply/requeue_max_age_hours", "6", std::to_string(config.requeue_max_age_hours), "6");
         record("apply/requeue_on_start", "false", config.requeue_on_start ? "true" : "false", "false");
         record("apply/unload_after_cancel", "false", config.unload_after_cancel ? "true" : "false", "false");
+        record("apply/unload_after_error", "false", config.unload_after_error ? "true" : "false", "false");
+        record("apply/unload_after_job", "true", config.unload_after_job ? "true" : "false", "true");
         record("apply/max_event_subscribers", "8", std::to_string(config.max_event_subscribers), "8");
         record("apply/data_dir", "C:/elsewhere", config.data_dir.string(), "C:/elsewhere");
     });

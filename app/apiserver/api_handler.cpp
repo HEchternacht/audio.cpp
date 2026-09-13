@@ -213,7 +213,20 @@ void ApiHandler::run_job(Job & job, const std::shared_ptr<engine::runtime::RunCo
         job.resolved_options[entry.first] = entry.second;
     }
 
-    const auto result = pool_.run(job.model_id, task_request, control);
+    // An exception here -- a CUDA OOM is the common one -- unwinds past the
+    // session's own cleanup, leaving its graph arenas resident. Reusing that
+    // session makes the *next* job fail on a smaller allocation, so the failure
+    // looks like it spreads. Drop the model instead; the next job pays a reload.
+    const auto result = [&] {
+        try {
+            return pool_.run(job.model_id, task_request, control);
+        } catch (...) {
+            if (config_.unload_after_error) {
+                pool_.unload(job.model_id);
+            }
+            throw;
+        }
+    }();
 
     if (result.audio_output.has_value()) {
         const auto wav = minitts::server::encode_pcm16_wav(*result.audio_output);
@@ -287,7 +300,7 @@ void ApiHandler::run_job(Job & job, const std::shared_ptr<engine::runtime::RunCo
     // A cancelled run may leave a session with a partially advanced KV cache and
     // graph arenas still resident, because the unwind skips the cleanup the
     // success path does. Unloading costs one reload and buys certainty.
-    if (control && control->cancelled() && config_.unload_after_cancel) {
+    if (config_.unload_after_job || (control && control->cancelled() && config_.unload_after_cancel)) {
         pool_.unload(job.model_id);
     }
 }
