@@ -1358,6 +1358,7 @@ audiocpp_add_model(yue2
         src/models/yue2/session.cpp
         src/models/yue2/tokenizer_text.cpp
         src/models/yue2/types.cpp
+        src/models/yue2/vram_budget.cpp
     INCLUDES
         engine/models/yue2/session.h
     LOADERS
@@ -2258,6 +2259,8 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         app/apiserver/api_config.cpp app/apiserver/model_pool.cpp
         app/server/model_memory.cpp app/server/config.cpp
         app/cli/args.cpp app/cli/request.cpp)
+    audiocpp_api_selftest(yue2_vram_budget AUDIOCPP_SELFTEST_YUE2_VRAM_BUDGET
+        src/models/yue2/vram_budget.cpp)
 
     if (ENGINE_BUILD_TESTS)
         add_executable(sentencepiece_tokenizer1_test

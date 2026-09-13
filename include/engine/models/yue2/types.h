@@ -111,6 +111,9 @@ struct Yue2RunOutput {
     std::vector<int32_t> semantic_codes;
     bool abc_truncated = false;
     bool semantic_truncated = false;
+    // Windows the run had to shrink to fit the device, one line each. Empty on
+    // a card with room, so a client can show it only when it means something.
+    std::vector<std::string> budget_notes;
 };
 
 const char * cot_mode_name(Yue2CotMode mode) noexcept;

@@ -3,6 +3,9 @@
 #include "engine/framework/debug/profiler.h"
 #include "engine/models/yue2/ar_runtime.h"
 #include "engine/models/yue2/nar_runtime.h"
+#include "engine/models/yue2/vram_budget.h"
+
+#include <ggml-backend.h>
 
 #include <algorithm>
 #include <chrono>
@@ -145,6 +148,52 @@ public:
         return out;
     }
 
+    // Free bytes on the device the model runs on, or 0 when that cannot be
+    // answered -- a CPU backend, or a device that does not report. Measured per
+    // stage rather than once, so each answer already accounts for what the
+    // stages before it still hold.
+    int64_t free_device_bytes() const {
+        auto * backend = execution->backend();
+        if (backend == nullptr) {
+            return 0;
+        }
+        auto * device = ggml_backend_get_device(backend);
+        if (device == nullptr) {
+            return 0;
+        }
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+        return static_cast<int64_t>(free_bytes);
+    }
+
+    // Headroom for everything that is not the KV cache: the graph arenas, the
+    // logits readback, the allocator's own rounding. Measured peaks on a 6 GB
+    // card sit about this far above the cache alone.
+    static constexpr int64_t kVramHeadroomBytes = 640LL << 20;
+
+    int64_t stage_token_cap(int64_t sequences) const {
+        const Yue2CacheDims dims{
+            assets->config.model.layers,
+            assets->config.model.kv_heads,
+            assets->config.model.head_dim,
+            4};
+        return yue2_max_tokens_for(free_device_bytes(), kVramHeadroomBytes,
+                                   yue2_cache_bytes_per_token(dims), sequences);
+    }
+
+    // Applies a stage's budget in place and records why, so a short take is
+    // explained rather than mysterious.
+    void fit_stage(const char * name, int64_t & window, int64_t sequences) {
+        const auto fitted = yue2_stage_window(name, window, stage_token_cap(sequences));
+        if (!fitted.clamped) {
+            return;
+        }
+        window = fitted.tokens;
+        budget_notes.push_back(fitted.note);
+        engine::debug::timing_log_scalar(std::string("yue2.budget.") + name, fitted.tokens);
+    }
+
     Yue2SemanticResult generate_semantic(const Yue2Request & request, Yue2Plan plan,
                                          runtime::RunControl * control = nullptr) {
         const auto total_start = Clock::now();
@@ -163,7 +212,9 @@ public:
         if (request.cot != Yue2CotMode::Off && request.abc.empty()) {
             ensure_ar();
             const auto abc_start = Clock::now();
-            out.plan.abc_ids = ar->generate(out.plan.prefix, abc_window(request.generation), request.seed, control);
+            auto abc = abc_window(request.generation);
+            fit_stage("abc_max_tokens", abc.max_tokens, 1);
+            out.plan.abc_ids = ar->generate(out.plan.prefix, abc, request.seed, control);
             engine::debug::timing_log_scalar("yue2.semantic.abc_generate_ms", engine::debug::elapsed_ms(abc_start));
             // Detokenise the plan the model just wrote. Until now these ids were
             // consumed as a prefix and discarded, so the score the model composed
@@ -185,10 +236,17 @@ public:
         engine::debug::timing_log_scalar("yue2.semantic.positive_prefix_tokens", out.plan.prefix.size());
         engine::debug::timing_log_scalar("yue2.semantic.negative_prefix_tokens", neg.size());
         const auto music_start = Clock::now();
+        auto semantic = semantic_window(request.generation);
+        // The prefix is part of the cache too, and guidance keeps a second one.
+        fit_stage("semantic_max_tokens", semantic.max_tokens,
+                  request_guidance_scale(request) == 1.0F ? 1 : 2);
+        semantic.max_tokens =
+            std::max<int64_t>(semantic.min_tokens,
+                              semantic.max_tokens - static_cast<int64_t>(out.plan.prefix.size()));
         out.tokens = ar->generate_cfg(
             out.plan.prefix,
             neg,
-            semantic_window(request.generation),
+            semantic,
             request_guidance_scale(request),
             request.seed,
             control);
@@ -216,6 +274,15 @@ public:
         }
         ensure_nar();
         ensure_ar();
+        // The acoustic stage prefills the AR over each chunk while the semantic
+        // caches are still resident, so this is measured last and gets what is
+        // left rather than a share decided up front.
+        int64_t context = generation.context;
+        fit_stage("nar_context", context, 1);
+        // chunk_ranges() needs (context - prefix - 3) / 2 >= 1, so a budget
+        // tighter than the prefix itself would turn an out-of-memory into a
+        // confusing "chunk leaves no acoustic context". Let it try instead.
+        context = std::max<int64_t>(context, static_cast<int64_t>(semantic.plan.prefix.size()) + 64);
         return nar->synthesize(
             semantic.plan.prefix,
             codec,
@@ -225,7 +292,7 @@ public:
             noise,
             seed,
             generation.ode_steps,
-            generation.context,
+            context,
             control);
     }
 
@@ -325,6 +392,7 @@ public:
     }
 
     Yue2RunOutput run_detailed(const Yue2Request & request, runtime::RunControl * control = nullptr) {
+        budget_notes.clear();
         const auto plan_start = Clock::now();
         auto planned = plan(request);
         engine::debug::timing_log_scalar("yue2.plan_ms", engine::debug::elapsed_ms(plan_start, Clock::now()));
@@ -351,6 +419,7 @@ public:
         out.semantic_codes = codec_from_semantic_tokens(semantic.tokens);
         out.abc_truncated = semantic.plan.truncated;
         out.semantic_truncated = semantic.truncated;
+        out.budget_notes = budget_notes;
         return out;
     }
 
@@ -425,6 +494,7 @@ private:
     }
 
     core::ExecutionContext * execution = nullptr;
+    std::vector<std::string> budget_notes;
     std::shared_ptr<const Yue2Assets> assets;
     Yue2TextTokenizer tokenizer;
     assets::TensorStorageType model_weight_type = assets::TensorStorageType::Native;

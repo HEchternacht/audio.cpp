@@ -238,6 +238,17 @@ std::string alignment_result_json(
             out << json_quote(result.text_output->language);
         }
     }
+    if (!result.notes.empty()) {
+        field("notes");
+        out << "[";
+        for (size_t i = 0; i < result.notes.size(); ++i) {
+            if (i != 0) {
+                out << ",";
+            }
+            out << json_quote(result.notes[i]);
+        }
+        out << "]";
+    }
     field("words");
     out << "[";
     for (size_t i = 0; i < result.word_timestamps.size(); ++i) {

@@ -239,6 +239,9 @@ runtime::TaskResult Yue2Session::run(const runtime::TaskRequest & request) {
 
     runtime::TaskResult result;
     result.audio_output = std::move(out.audio);
+    // Windows the run had to shrink to fit the card. Without this a short take
+    // on a small GPU looks like the model simply stopped early.
+    result.notes = std::move(out.budget_notes);
 
     // The score the model wrote before it sang. Returning it is what turns a
     // generation into something editable: change a bar, send it back as `abc`,

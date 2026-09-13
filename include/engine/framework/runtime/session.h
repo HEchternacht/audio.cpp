@@ -214,6 +214,10 @@ struct TaskResult {
     std::vector<WordTimestamp> word_timestamps;
     std::optional<VoiceArtifact> artifact_output = std::nullopt;
     std::vector<VoiceArtifact> output_artifacts;
+    // Anything the run wants the caller to know that is not a failure: a window
+    // it had to shrink to fit the device, a setting it ignored. Families that
+    // have nothing to say leave it empty.
+    std::vector<std::string> notes;
 };
 
 struct StreamEvent {
