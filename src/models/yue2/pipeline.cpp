@@ -249,9 +249,15 @@ public:
         engine::debug::timing_log_scalar("yue2.semantic.negative_prefix_tokens", neg.size());
         const auto music_start = Clock::now();
         auto semantic = semantic_window(request.generation);
-        // The prefix is part of the cache too, and guidance keeps a second one.
-        fit_stage("semantic_max_tokens", semantic.max_tokens,
-                  request_guidance_scale(request) == 1.0F ? 1 : 2, kYue2DecodeCostWeight);
+        // Every token decoded here is paid for twice: once in this stage's own
+        // cache -- twice over when guidance keeps a negative one -- and again in
+        // the acoustic stage, which prefills the AR over the whole take while
+        // these caches are still resident and costs about three caches a token
+        // doing it. Budgeting both together here is what lets the acoustic stage
+        // run in one piece, which is the only way it sounds right.
+        const int64_t decode_caches = request_guidance_scale(request) == 1.0F ? 1 : 2;
+        fit_stage("semantic_max_tokens", semantic.max_tokens, 1,
+                  decode_caches + kYue2PrefixStateCostWeight);
         semantic.max_tokens =
             std::max<int64_t>(semantic.min_tokens,
                               semantic.max_tokens - static_cast<int64_t>(out.plan.prefix.size()));
@@ -286,15 +292,14 @@ public:
         }
         ensure_nar();
         ensure_ar();
-        // The acoustic stage prefills the AR over each chunk while the semantic
-        // caches are still resident, so this is measured last and gets what is
-        // left rather than a share decided up front.
-        int64_t context = generation.context;
-        fit_stage("nar_context", context, 1, kYue2PrefixStateCostWeight);
-        // chunk_ranges() needs (context - prefix - 3) / 2 >= 1, so a budget
-        // tighter than the prefix itself would turn an out-of-memory into a
-        // confusing "chunk leaves no acoustic context". Let it try instead.
-        context = std::max<int64_t>(context, static_cast<int64_t>(semantic.plan.prefix.size()) + 64);
+        // Deliberately unbudgeted. Splitting the take into chunks is the one
+        // economy that is audible: each chunk is solved against its own window
+        // only, so the seams arrive as a lurch every few seconds. A take that is
+        // shorter but whole is worth more than a long one that is stitched, so
+        // the length is budgeted instead -- at the semantic stage, which is
+        // where the decision can still be made -- and this window is left at
+        // whatever the caller asked for.
+        const int64_t context = generation.context;
         return nar->synthesize(
             semantic.plan.prefix,
             codec,
