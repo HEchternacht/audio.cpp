@@ -59,6 +59,14 @@ struct Yue2GenerationConfig {
     Yue2SamplingConfig semantic;
     int64_t ode_steps = 32;
     int64_t context = kContextTokens;
+    // Device memory held back from the per-stage KV budget, for the graph
+    // arenas and the allocator's own slack. Raising it shortens every window,
+    // which is the lever a caller has when a run still runs out of memory.
+    int64_t vram_headroom_mb = 640;
+    // Shrinks every window the budget allows, multiplicatively. 1.0 trusts the
+    // estimate; a run that ran out of memory anyway is retried at 0.5, then
+    // 0.25, which no amount of unaccounted overhead can defeat.
+    double vram_budget_scale = 1.0;
 };
 
 struct Yue2Config {

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -170,22 +171,33 @@ public:
     // Headroom for everything that is not the KV cache: the graph arenas, the
     // logits readback, the allocator's own rounding. Measured peaks on a 6 GB
     // card sit about this far above the cache alone.
-    static constexpr int64_t kVramHeadroomBytes = 640LL << 20;
+    int64_t vram_headroom_bytes = 640LL << 20;
+    double vram_budget_scale = 1.0;
 
-    int64_t stage_token_cap(int64_t sequences) const {
+    int64_t stage_token_cap(int64_t sequences, int64_t cost_weight) const {
         const Yue2CacheDims dims{
             assets->config.model.layers,
             assets->config.model.kv_heads,
             assets->config.model.head_dim,
             4};
-        return yue2_max_tokens_for(free_device_bytes(), kVramHeadroomBytes,
-                                   yue2_cache_bytes_per_token(dims), sequences);
+        const int64_t free_bytes = free_device_bytes();
+        return yue2_max_tokens_for(free_bytes,
+                                   yue2_effective_headroom(free_bytes, vram_headroom_bytes),
+                                   yue2_cache_bytes_per_token(dims), sequences, cost_weight,
+                                   vram_budget_scale);
     }
 
     // Applies a stage's budget in place and records why, so a short take is
     // explained rather than mysterious.
-    void fit_stage(const char * name, int64_t & window, int64_t sequences) {
-        const auto fitted = yue2_stage_window(name, window, stage_token_cap(sequences));
+    void fit_stage(const char * name, int64_t & window, int64_t sequences, int64_t cost_weight) {
+        const int64_t free_bytes = free_device_bytes();
+        const auto fitted = yue2_stage_window(name, window, stage_token_cap(sequences, cost_weight));
+        // One line per stage, on stderr rather than the timing log, because the
+        // number that decides whether a run survives should be in the server log
+        // without anyone having to turn tracing on.
+        std::fprintf(stderr, "[yue2] %s: %lld free MiB, %lld sequences, window %lld -> %lld\n", name,
+                     static_cast<long long>(free_bytes >> 20), static_cast<long long>(sequences),
+                     static_cast<long long>(window), static_cast<long long>(fitted.tokens));
         if (!fitted.clamped) {
             return;
         }
@@ -213,7 +225,7 @@ public:
             ensure_ar();
             const auto abc_start = Clock::now();
             auto abc = abc_window(request.generation);
-            fit_stage("abc_max_tokens", abc.max_tokens, 1);
+            fit_stage("abc_max_tokens", abc.max_tokens, 1, kYue2DecodeCostWeight);
             out.plan.abc_ids = ar->generate(out.plan.prefix, abc, request.seed, control);
             engine::debug::timing_log_scalar("yue2.semantic.abc_generate_ms", engine::debug::elapsed_ms(abc_start));
             // Detokenise the plan the model just wrote. Until now these ids were
@@ -239,7 +251,7 @@ public:
         auto semantic = semantic_window(request.generation);
         // The prefix is part of the cache too, and guidance keeps a second one.
         fit_stage("semantic_max_tokens", semantic.max_tokens,
-                  request_guidance_scale(request) == 1.0F ? 1 : 2);
+                  request_guidance_scale(request) == 1.0F ? 1 : 2, kYue2DecodeCostWeight);
         semantic.max_tokens =
             std::max<int64_t>(semantic.min_tokens,
                               semantic.max_tokens - static_cast<int64_t>(out.plan.prefix.size()));
@@ -278,7 +290,7 @@ public:
         // caches are still resident, so this is measured last and gets what is
         // left rather than a share decided up front.
         int64_t context = generation.context;
-        fit_stage("nar_context", context, 1);
+        fit_stage("nar_context", context, 1, kYue2PrefixStateCostWeight);
         // chunk_ranges() needs (context - prefix - 3) / 2 >= 1, so a budget
         // tighter than the prefix itself would turn an out-of-memory into a
         // confusing "chunk leaves no acoustic context". Let it try instead.
@@ -393,6 +405,8 @@ public:
 
     Yue2RunOutput run_detailed(const Yue2Request & request, runtime::RunControl * control = nullptr) {
         budget_notes.clear();
+        vram_headroom_bytes = request.generation.vram_headroom_mb << 20;
+        vram_budget_scale = request.generation.vram_budget_scale;
         const auto plan_start = Clock::now();
         auto planned = plan(request);
         engine::debug::timing_log_scalar("yue2.plan_ms", engine::debug::elapsed_ms(plan_start, Clock::now()));

@@ -60,6 +60,11 @@ struct ApiConfig {
     // a few of those in a row are the difference between fitting and not.
     bool unload_after_job = false;
 
+    // How many times a job that ran out of device memory is retried with more
+    // memory held back from the model's own window sizing. Each retry doubles
+    // it, so two attempts quarter the budget. 0 disables the retry.
+    int oom_retries = 2;
+
     size_t max_event_subscribers = 64;
 };
 

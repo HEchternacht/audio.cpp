@@ -89,6 +89,7 @@ The "api" config block, with its defaults:
     "unload_after_cancel": true,
     "unload_after_error": true,
     "unload_after_job": false,
+    "oom_retries": 2,
     "progress_interval_ms": 250,
     "max_event_subscribers": 64
   }

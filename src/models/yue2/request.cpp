@@ -85,6 +85,14 @@ void apply_options(
     if (out.generation.context < 256) {
         throw std::runtime_error("Yue2 nar_context must be at least 256");
     }
+    out.generation.vram_headroom_mb =
+        runtime::parse_positive_i64_option(options, {"vram_headroom_mb"}, out.generation.vram_headroom_mb);
+    if (const auto value = runtime::parse_finite_float_option(options, {"vram_budget_scale"})) {
+        if (*value <= 0.0F || *value > 1.0F) {
+            throw std::runtime_error("Yue2 vram_budget_scale must be in (0,1]");
+        }
+        out.generation.vram_budget_scale = static_cast<double>(*value);
+    }
     auto apply_sampling = [&options](Yue2SamplingConfig & sampling, const std::string & prefix) {
         if (const auto value = runtime::parse_finite_float_option(options, {prefix + "_temperature"})) {
             sampling.temperature = *value;

@@ -213,18 +213,42 @@ void ApiHandler::run_job(Job & job, const std::shared_ptr<engine::runtime::RunCo
         job.resolved_options[entry.first] = entry.second;
     }
 
-    // An exception here -- a CUDA OOM is the common one -- unwinds past the
-    // session's own cleanup, leaving its graph arenas resident. Reusing that
-    // session makes the *next* job fail on a smaller allocation, so the failure
-    // looks like it spreads. Drop the model instead; the next job pays a reload.
+    // Running out of device memory is the one failure worth retrying. The model
+    // sizes its own windows against the free memory it measures, but that
+    // estimate cannot account for every graph arena and allocator rounding, so
+    // a tight card can still miss. Each retry doubles the memory held back from
+    // that estimate, which shortens every window; two retries quarter it, well
+    // past any run that was close.
+    //
+    // Retrying is only safe because an exception unwinds past the session's own
+    // cleanup, leaving its arenas resident: the model has to be dropped between
+    // attempts either way, so a retry starts on a clean device rather than on
+    // the wreckage of the attempt before it.
     const auto result = [&] {
-        try {
-            return pool_.run(job.model_id, task_request, control);
-        } catch (...) {
-            if (config_.unload_after_error) {
-                pool_.unload(job.model_id);
+        double scale = 0.0;
+        for (int attempt = 0;; ++attempt) {
+            try {
+                return pool_.run(job.model_id, task_request, control);
+            } catch (const std::exception & ex) {
+                const std::string message = ex.what();
+                const bool out_of_memory = message.find("failed to allocate") != std::string::npos;
+                if (config_.unload_after_error || out_of_memory) {
+                    pool_.unload(job.model_id);
+                }
+                if (!out_of_memory || attempt >= config_.oom_retries ||
+                    (control && control->cancelled())) {
+                    throw;
+                }
+                // Halving the budget outright, rather than raising the memory
+                // held back from it: holding back more than the device has left
+                // cannot shrink a window past zero, so that ladder flattens
+                // exactly when it is needed most.
+                scale = scale == 0.0 ? 0.5 : scale / 2.0;
+                task_request.options["vram_budget_scale"] = std::to_string(scale);
+                job.resolved_options["vram_budget_scale"] = std::to_string(scale);
+                std::cerr << "[api] job " << job.id << " ran out of device memory (" << message
+                          << "); retrying at " << scale << " of the memory budget" << std::endl;
             }
-            throw;
         }
     }();
 

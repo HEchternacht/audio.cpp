@@ -50,6 +50,7 @@ ApiConfig apply_api_overrides(ApiConfig defaults, const Value & document) {
         engine::io::json::optional_bool(*api, "unload_after_error", config.unload_after_error);
     config.unload_after_job =
         engine::io::json::optional_bool(*api, "unload_after_job", config.unload_after_job);
+    config.oom_retries = static_cast<int>(optional_i64_at(*api, "oom_retries", config.oom_retries));
     config.max_event_subscribers = static_cast<size_t>(optional_i64_at(
         *api, "max_event_subscribers", static_cast<int64_t>(config.max_event_subscribers)));
 
@@ -151,6 +152,7 @@ int main() {
                config.unload_after_error ? "true" : "false", "true");
         record("apply/default_unload_after_job", "{}",
                config.unload_after_job ? "true" : "false", "false");
+        record("apply/default_oom_retries", "{}", std::to_string(config.oom_retries), "2");
     });
 
     guarded("apply_api_overrides/each_field", [] {
@@ -170,6 +172,7 @@ int main() {
             "unload_after_cancel": false,
             "unload_after_error": false,
             "unload_after_job": true,
+            "oom_retries": 1,
             "max_event_subscribers": 8,
             "data_dir": "C:/elsewhere"
         }})");
@@ -187,6 +190,7 @@ int main() {
         record("apply/unload_after_cancel", "false", config.unload_after_cancel ? "true" : "false", "false");
         record("apply/unload_after_error", "false", config.unload_after_error ? "true" : "false", "false");
         record("apply/unload_after_job", "true", config.unload_after_job ? "true" : "false", "true");
+        record("apply/oom_retries", "1", std::to_string(config.oom_retries), "1");
         record("apply/max_event_subscribers", "8", std::to_string(config.max_event_subscribers), "8");
         record("apply/data_dir", "C:/elsewhere", config.data_dir.string(), "C:/elsewhere");
     });

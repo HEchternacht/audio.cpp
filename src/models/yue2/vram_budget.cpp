@@ -7,16 +7,26 @@ int64_t yue2_cache_bytes_per_token(const Yue2CacheDims & dims) {
     return 2 * dims.layers * dims.kv_heads * dims.head_dim * dims.bytes_per_element;
 }
 
+int64_t yue2_effective_headroom(int64_t free_bytes, int64_t requested_headroom_bytes) {
+    if (free_bytes <= 0) {
+        return requested_headroom_bytes;
+    }
+    const int64_t half = free_bytes / 2;
+    return requested_headroom_bytes < half ? requested_headroom_bytes : half;
+}
+
 int64_t yue2_max_tokens_for(int64_t free_bytes, int64_t headroom_bytes,
-                            int64_t bytes_per_token, int64_t sequences) {
-    if (bytes_per_token <= 0 || sequences <= 0) {
+                            int64_t bytes_per_token, int64_t sequences,
+                            int64_t cost_weight, double scale) {
+    if (bytes_per_token <= 0 || sequences <= 0 || cost_weight <= 0 || scale <= 0.0) {
         return 0;
     }
     const int64_t usable = free_bytes - headroom_bytes;
     if (usable <= 0) {
         return 0;
     }
-    return usable / (bytes_per_token * sequences);
+    const int64_t tokens = usable / (bytes_per_token * sequences * cost_weight);
+    return static_cast<int64_t>(static_cast<double>(tokens) * scale);
 }
 
 Yue2StageWindow yue2_stage_window(const std::string & name, int64_t requested, int64_t cap) {
@@ -77,6 +87,27 @@ int main() {
            std::to_string(yue2_max_tokens_for(1LL << 30, 0, per_token, 0)), "0");
     record("yue2_max_tokens_for", "unmeasurable free memory",
            std::to_string(yue2_max_tokens_for(0, 0, per_token, 1)), "0");
+
+    record("yue2_effective_headroom", "640 MiB asked of 2 GiB free",
+           std::to_string(yue2_effective_headroom(2LL << 30, 640LL << 20)), "671088640");
+    record("yue2_effective_headroom", "2560 MiB asked of 978 MiB free",
+           std::to_string(yue2_effective_headroom(978LL << 20, 2560LL << 20)), "512753664");
+    record("yue2_effective_headroom", "free unmeasurable, request kept",
+           std::to_string(yue2_effective_headroom(0, 640LL << 20)), "671088640");
+    record("yue2_max_tokens_for", "prefix-state weight, three caches a token",
+           std::to_string(yue2_max_tokens_for(1LL << 30, 256LL << 20, per_token, 1,
+                                              kYue2PrefixStateCostWeight)),
+           "1170");
+    record("yue2_max_tokens_for", "half scale after a retry",
+           std::to_string(yue2_max_tokens_for(1LL << 30, 256LL << 20, per_token, 1,
+                                              kYue2DecodeCostWeight, 0.5)),
+           "1755");
+    record("yue2_max_tokens_for", "scale of zero is not a budget",
+           std::to_string(yue2_max_tokens_for(1LL << 30, 256LL << 20, per_token, 1, 1, 0.0)), "0");
+    record("yue2_max_tokens_for", "headroom capped at half, so a budget remains",
+           std::to_string(yue2_max_tokens_for(978LL << 20, yue2_effective_headroom(978LL << 20, 2560LL << 20),
+                                              per_token, 1)),
+           "2235");
 
     {
         const auto window = yue2_stage_window("semantic_max_tokens", 9000, 4772);

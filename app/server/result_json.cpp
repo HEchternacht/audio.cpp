@@ -147,6 +147,17 @@ std::string task_result_json_with_timing(
             out << json_quote(result.text_output->language);
         }
     }
+    if (!result.notes.empty()) {
+        field("notes");
+        out << "[";
+        for (size_t i = 0; i < result.notes.size(); ++i) {
+            if (i != 0) {
+                out << ",";
+            }
+            out << json_quote(result.notes[i]);
+        }
+        out << "]";
+    }
     if (result.audio_output.has_value()) {
         const auto wav = encode_pcm16_wav(*result.audio_output);
         field("audio");
@@ -237,17 +248,6 @@ std::string alignment_result_json(
             field("language");
             out << json_quote(result.text_output->language);
         }
-    }
-    if (!result.notes.empty()) {
-        field("notes");
-        out << "[";
-        for (size_t i = 0; i < result.notes.size(); ++i) {
-            if (i != 0) {
-                out << ",";
-            }
-            out << json_quote(result.notes[i]);
-        }
-        out << "]";
     }
     field("words");
     out << "[";

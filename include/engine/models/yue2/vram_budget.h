@@ -29,10 +29,31 @@ struct Yue2CacheDims {
 // Bytes of KV cache one token of one sequence costs.
 int64_t yue2_cache_bytes_per_token(const Yue2CacheDims & dims);
 
+// The headroom a stage can actually hold back. A caller raising the headroom to
+// force smaller windows -- the retry after an out-of-memory does exactly that --
+// can easily name more than the device has left, and a headroom above the free
+// memory would leave no budget at all and be read as "could not measure". Never
+// hold back more than half of what is free, so a budget always exists and always
+// shrinks when the caller asks for more headroom.
+int64_t yue2_effective_headroom(int64_t free_bytes, int64_t requested_headroom_bytes);
+
+// What a stage costs per token, as a multiple of one plain KV cache entry.
+// Token decoding pays exactly one cache. The acoustic stage's prefix-state
+// graph pays far more: it materialises the whole prefix as f32, rounds it to
+// bf16, casts to f16 and copies that into the cache, so several representations
+// of the same tokens are live at once. Measured at about 2.5x on the 3B; 3 is
+// the number used, because being wrong here costs a whole run.
+constexpr int64_t kYue2DecodeCostWeight = 1;
+constexpr int64_t kYue2PrefixStateCostWeight = 3;
+
 // The largest window that fits, for `sequences` concurrent caches -- guidance
-// runs a positive and a negative one. Returns 0 when not even one token fits.
+// runs a positive and a negative one -- at `cost_weight` caches per token.
+// `scale` shrinks the answer further; a retry after an out-of-memory halves it,
+// which is the one escalation that cannot be defeated by a tight device.
+// Returns 0 when not even one token fits.
 int64_t yue2_max_tokens_for(int64_t free_bytes, int64_t headroom_bytes,
-                            int64_t bytes_per_token, int64_t sequences);
+                            int64_t bytes_per_token, int64_t sequences,
+                            int64_t cost_weight = 1, double scale = 1.0);
 
 // The window a stage should actually use, and why. `cap` of 0 means the free
 // memory could not be measured, in which case `requested` is honoured: a run

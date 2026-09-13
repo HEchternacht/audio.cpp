@@ -91,30 +91,48 @@ ignores.
 | `unload_after_cancel` | `true` | Drop the session after a cancel rather than reusing it |
 | `unload_after_error` | `true` | Drop it after a failed run too. A run that throws unwinds past the session's own cleanup, so its graph arenas stay resident and the next job fails on a smaller allocation |
 | `unload_after_job` | `false` | Drop it after every job. Costs one reload; worth it where peak VRAM sits close to the card |
+| `oom_retries` | `2` | Times a job that ran out of device memory is retried on a halved memory budget. `0` disables |
 | `progress_interval_ms` | `250` | Throttle for progress events |
 | `max_event_subscribers` | `64` | Each SSE stream costs a connection thread |
 
-### Fitting a long take on a small card
+### Running out of device memory
 
-yue2's acoustic stage solves the take in chunks of `nar_context` tokens, and
-prefills the AR over each chunk to condition it. At the 24576 default a
-full-length song is a single chunk, whose AR prefix-state cache alone asks for
-about 2 GiB on top of the weights — measured peak 5.7 GiB of a 6.1 GiB card, so
-the allocation fails and the job reports `failed to allocate Yue2 AR
-prefix-state cache`. It is not a leak and not specific to this server: the same
-request fails the same way on `audiocpp_server`.
+Every yue2 stage allocates its whole KV cache up front, for the window it was
+asked for: one f32 K and one f32 V per layer per token, 224 KiB a token on the
+3B. The stock windows -- 4096 planner tokens, 9000 semantic, a 24576 acoustic
+window -- are sized for a card several times larger than a 6 GB one, so a run
+would decode for minutes and then die on `failed to allocate ... graph`. The
+same request fails the same way on upstream `audiocpp_server`; it is not a leak
+and not specific to this server.
 
-Pass `nar_context` in the request options to split the take instead:
+The server handles this in two layers, and neither needs configuring:
 
-```json
-{"model": "yue2-3b-q8", "request": {"text": "...", "options": {
-  "style": "j-rock, anime opening", "nar_context": "4096"}}}
-```
+1. **Each stage is measured against the device before it starts.** Free memory
+   is read immediately before the planner, the semantic decode and the acoustic
+   solve, and that stage's window is clamped to what fits. Measuring per stage
+   rather than once means each answer already accounts for what the earlier
+   stages still hold. A card with room clamps nothing.
+2. **A run that runs out anyway is retried on a smaller budget.** It stays the
+   same job; the model is dropped, the budget halves, and it starts again.
+   `oom_retries` (default 2) bounds this, so the worst case is a budget
+   quartered rather than an endless loop. Each retry is logged.
 
-Measured on an RTX 4050 (6 GB): the same prompt that failed at the default
-rendered 2:47 of audio with `nar_context: 4096`, peaking at 5.5 GiB. Lower it
-further if the card is smaller; the chunk is `(nar_context - prefix - 3) / 2`
-tokens, so halving it roughly halves the acoustic stage's peak.
+Windows that were shortened appear in the job's `result` output under `notes`,
+so a short take on a small card says why rather than looking like the model
+stopped early.
+
+Three request options override the estimate when you know better:
+
+| Option | Default | Effect |
+|---|---:|---|
+| `nar_context` | `24576` | Acoustic window in tokens; the chunk solved at once is `(nar_context - prefix - 3) / 2` |
+| `vram_headroom_mb` | `640` | Held back from the estimate for graph arenas and allocator slack. Never more than half of what is free |
+| `vram_budget_scale` | `1.0` | Multiplies every window the budget allows. The lever the retry escalates |
+
+Measured on an RTX 4050 (6 GB), everything at stock defaults: prompts that had
+failed render 2:02, 3:23 and 2:37 of audio, peaking at 5.2-5.5 GiB. The cost is
+length -- on a card this size the budget lands well short of the model's
+six-minute ceiling.
 
 `--host`, `--port`, `--workers`, `--data-dir` and `--cors-origins` override the
 file.
