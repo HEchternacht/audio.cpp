@@ -600,7 +600,8 @@ struct Yue2NarRuntime::Impl {
     std::vector<float> solve_chunk(
         const Yue2ArDevicePrefixState & ar_state,
         const std::vector<float> & noise,
-        int64_t ode_steps) {
+        int64_t ode_steps,
+        runtime::RunControl * control = nullptr) {
         auto state = noise;
         const auto total_start = Clock::now();
         const auto & config = assets->config.model;
@@ -611,6 +612,15 @@ struct Yue2NarRuntime::Impl {
         HostVelocityTiming host_timing;
         double host_update_ms = 0.0;
         for (int64_t step = 0; step < ode_steps; ++step) {
+            // One step is two velocity evaluations over the whole sequence, so a
+            // cancel here waits far longer than one in the token loop. Polling
+            // between the two halves below would halve that, at the cost of
+            // leaving the solver mid-step -- not worth it while the state is
+            // discarded on unwind anyway.
+            if (control != nullptr) {
+                control->throw_if_cancelled();
+                control->progress(runtime::ProgressEvent{"acoustic", step, ode_steps, ""});
+            }
             const float t = 1.0F - static_cast<float>(step) * dt;
             const auto first = velocity(chunk_graph, ar_state, state, logit_clamped(t), host_timing);
             const auto mid_start = Clock::now();
@@ -646,7 +656,8 @@ struct Yue2NarRuntime::Impl {
         const std::vector<float> & noise,
         uint64_t seed,
         int64_t ode_steps,
-        int64_t context) {
+        int64_t context,
+        runtime::RunControl * control = nullptr) {
         const auto total_start = Clock::now();
         const auto & config = assets->config.model;
         const auto ranges = chunk_ranges(static_cast<int64_t>(codec.size()), static_cast<int64_t>(prefix.size()), context);
@@ -698,7 +709,7 @@ struct Yue2NarRuntime::Impl {
             auto ar_state = prefill_state(ar_tokens);
             prefill_ms += engine::debug::elapsed_ms(prefill_start);
             const auto solve_start = Clock::now();
-            auto chunk = solve_chunk(ar_state, noise, ode_steps);
+            auto chunk = solve_chunk(ar_state, noise, ode_steps, control);
             solve_ms += engine::debug::elapsed_ms(solve_start);
             const auto append_start = Clock::now();
             out.insert(out.end(), chunk.begin(), chunk.end());
@@ -743,8 +754,9 @@ std::vector<float> Yue2NarRuntime::synthesize(
     const std::vector<float> & noise,
     uint64_t seed,
     int64_t ode_steps,
-    int64_t context) {
-    return impl_->synthesize(prefix, codec, prefill_state, noise, seed, ode_steps, context);
+    int64_t context,
+    runtime::RunControl * control) {
+    return impl_->synthesize(prefix, codec, prefill_state, noise, seed, ode_steps, context, control);
 }
 
 void Yue2NarRuntime::release_runtime_graphs() {

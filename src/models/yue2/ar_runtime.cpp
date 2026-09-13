@@ -677,7 +677,8 @@ struct Yue2ArRuntime::Impl {
     std::vector<int32_t> generate(
         const std::vector<int32_t> & prefix,
         const Yue2ArSamplingWindow & window,
-        uint64_t seed) {
+        uint64_t seed,
+        runtime::RunControl * control = nullptr) {
         if (prefix.empty()) {
             throw std::runtime_error("Yue2 AR prefix must not be empty");
         }
@@ -709,6 +710,12 @@ struct Yue2ArRuntime::Impl {
         double refill_prefill_ms = 0.0;
         int64_t refill_count = 0;
         for (int64_t step = 0; step < window.max_tokens; ++step) {
+            // The only place a cancel can land: between decoded tokens. A token
+            // is tens of milliseconds, so this is the fast branch of the two.
+            if (control != nullptr) {
+                control->throw_if_cancelled();
+                control->progress(runtime::ProgressEvent{"score", step, window.max_tokens, ""});
+            }
             const auto sample_start = Clock::now();
             const int32_t token = compact_semantic ?
                 sample_semantic_token(logits, emitted, window, rng, scratch) :
@@ -765,9 +772,10 @@ struct Yue2ArRuntime::Impl {
         const std::vector<int32_t> & negative_prefix,
         const Yue2ArSamplingWindow & window,
         float guidance_scale,
-        uint64_t seed) {
+        uint64_t seed,
+        runtime::RunControl * control = nullptr) {
         if (guidance_scale == 1.0F) {
-            return generate(positive_prefix, window, seed);
+            return generate(positive_prefix, window, seed, control);
         }
         const bool compact_semantic = is_semantic_window(window);
         const bool compact_abc = is_abc_window(window);
@@ -803,6 +811,12 @@ struct Yue2ArRuntime::Impl {
         double sample_ms = 0.0;
         double decode_batched_ms = 0.0;
         for (int64_t step = 0; step < window.max_tokens; ++step) {
+            // The long loop: this is where most of a generation's wall time goes,
+            // so it is also where a cancel most often lands.
+            if (control != nullptr) {
+                control->throw_if_cancelled();
+                control->progress(runtime::ProgressEvent{"semantic", step, window.max_tokens, ""});
+            }
             if (positive.logits.size() != negative.logits.size()) {
                 throw std::runtime_error("Yue2 CFG logits size mismatch");
             }
@@ -999,8 +1013,9 @@ Yue2ArRuntime::~Yue2ArRuntime() = default;
 std::vector<int32_t> Yue2ArRuntime::generate(
     const std::vector<int32_t> & prefix,
     const Yue2ArSamplingWindow & window,
-    uint64_t seed) {
-    return impl_->generate(prefix, window, seed);
+    uint64_t seed,
+    runtime::RunControl * control) {
+    return impl_->generate(prefix, window, seed, control);
 }
 
 std::vector<int32_t> Yue2ArRuntime::generate_cfg(
@@ -1008,8 +1023,9 @@ std::vector<int32_t> Yue2ArRuntime::generate_cfg(
     const std::vector<int32_t> & negative_prefix,
     const Yue2ArSamplingWindow & window,
     float guidance_scale,
-    uint64_t seed) {
-    return impl_->generate_cfg(positive_prefix, negative_prefix, window, guidance_scale, seed);
+    uint64_t seed,
+    runtime::RunControl * control) {
+    return impl_->generate_cfg(positive_prefix, negative_prefix, window, guidance_scale, seed, control);
 }
 
 runtime::TransformerKVState Yue2ArRuntime::prefill_state(const std::vector<int32_t> & tokens) {

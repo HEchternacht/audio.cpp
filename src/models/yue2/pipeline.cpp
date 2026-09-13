@@ -145,7 +145,8 @@ public:
         return out;
     }
 
-    Yue2SemanticResult generate_semantic(const Yue2Request & request, Yue2Plan plan) {
+    Yue2SemanticResult generate_semantic(const Yue2Request & request, Yue2Plan plan,
+                                         runtime::RunControl * control = nullptr) {
         const auto total_start = Clock::now();
         Yue2SemanticResult out;
         out.plan = std::move(plan);
@@ -162,8 +163,13 @@ public:
         if (request.cot != Yue2CotMode::Off && request.abc.empty()) {
             ensure_ar();
             const auto abc_start = Clock::now();
-            out.plan.abc_ids = ar->generate(out.plan.prefix, abc_window(request.generation), request.seed);
+            out.plan.abc_ids = ar->generate(out.plan.prefix, abc_window(request.generation), request.seed, control);
             engine::debug::timing_log_scalar("yue2.semantic.abc_generate_ms", engine::debug::elapsed_ms(abc_start));
+            // Detokenise the plan the model just wrote. Until now these ids were
+            // consumed as a prefix and discarded, so the score the model composed
+            // was never visible -- which is what made the documented
+            // edit-the-score-and-re-render workflow impossible to reach.
+            out.plan.abc = tokenizer.decode(out.plan.abc_ids);
             out.plan.truncated = static_cast<int64_t>(out.plan.abc_ids.size()) >= request.generation.abc.max_tokens;
             out.plan.prefix.insert(out.plan.prefix.end(), out.plan.abc_ids.begin(), out.plan.abc_ids.end());
             out.plan.prefix.push_back(kAbcEndToken);
@@ -184,7 +190,8 @@ public:
             neg,
             semantic_window(request.generation),
             request_guidance_scale(request),
-            request.seed);
+            request.seed,
+            control);
         engine::debug::timing_log_scalar("yue2.semantic.music_generate_ms", engine::debug::elapsed_ms(music_start));
         out.truncated = static_cast<int64_t>(out.tokens.size()) >= request.generation.semantic.max_tokens;
         engine::debug::timing_log_scalar("yue2.semantic.tokens", out.tokens.size());
@@ -198,7 +205,8 @@ public:
         const Yue2SemanticResult & semantic,
         const Yue2GenerationConfig & generation,
         const std::vector<float> & noise,
-        uint64_t seed) {
+        uint64_t seed,
+        runtime::RunControl * control = nullptr) {
         const auto codec_start = Clock::now();
         const auto codec = codec_from_semantic_tokens(semantic.tokens);
         engine::debug::timing_log_scalar("yue2.nar.codec_extract_ms", engine::debug::elapsed_ms(codec_start));
@@ -217,10 +225,12 @@ public:
             noise,
             seed,
             generation.ode_steps,
-            generation.context);
+            generation.context,
+            control);
     }
 
-    runtime::AudioBuffer decode_audio(const std::vector<float> & latents, int64_t frames) {
+    runtime::AudioBuffer decode_audio(const std::vector<float> & latents, int64_t frames,
+                                      runtime::RunControl * control = nullptr) {
         ensure_vae();
         const int64_t channels = assets->config.model.latent_dim;
         if (frames <= 0 || static_cast<int64_t>(latents.size()) != frames * channels) {
@@ -272,7 +282,15 @@ public:
         int64_t tiles = 0;
         double tile_decode_ms = 0.0;
         double tile_copy_ms = 0.0;
+        const int64_t tile_total = core_frames > 0 ? (frames + core_frames - 1) / core_frames : 0;
         for (int64_t start = 0; start < frames; start += core_frames) {
+            // A tile is roughly forty seconds of audio through the decoder, so
+            // this is the coarsest of the four cancel points -- but it is also
+            // the last stage, where a cancel is least likely to be wanted.
+            if (control != nullptr) {
+                control->throw_if_cancelled();
+                control->progress(runtime::ProgressEvent{"decode", tiles, tile_total, ""});
+            }
             const int64_t end = std::min(frames, start + core_frames);
             const int64_t left = std::max<int64_t>(0, start - halo_frames);
             const int64_t right = std::min(frames, end + halo_frames);
@@ -306,26 +324,38 @@ public:
         return audio;
     }
 
-    runtime::AudioBuffer run(const Yue2Request & request) {
+    Yue2RunOutput run_detailed(const Yue2Request & request, runtime::RunControl * control = nullptr) {
         const auto plan_start = Clock::now();
         auto planned = plan(request);
         engine::debug::timing_log_scalar("yue2.plan_ms", engine::debug::elapsed_ms(plan_start, Clock::now()));
         const auto semantic_start = Clock::now();
-        auto semantic = generate_semantic(request, std::move(planned));
+        auto semantic = generate_semantic(request, std::move(planned), control);
         engine::debug::timing_log_scalar("yue2.semantic_ms", engine::debug::elapsed_ms(semantic_start, Clock::now()));
         const auto nar_start = Clock::now();
-        auto latents = synthesize_latents(semantic, request.generation, request.nar_noise, request.seed);
+        auto latents = synthesize_latents(semantic, request.generation, request.nar_noise, request.seed, control);
         engine::debug::timing_log_scalar("yue2.nar_ms", engine::debug::elapsed_ms(nar_start, Clock::now()));
         const int64_t frames = static_cast<int64_t>(latents.size()) / assets->config.model.latent_dim;
         ar.reset();
         nar.reset();
         const auto vae_start = Clock::now();
-        auto audio = decode_audio(latents, frames);
+        auto audio = decode_audio(latents, frames, control);
         engine::debug::timing_log_scalar("yue2.vae_decode_ms", engine::debug::elapsed_ms(vae_start, Clock::now()));
         if (vae) {
             vae->release_runtime_graphs();
         }
-        return audio;
+
+        Yue2RunOutput out;
+        out.audio = std::move(audio);
+        out.abc = semantic.plan.abc;
+        // Offset already stripped, so these feed straight back into a request.
+        out.semantic_codes = codec_from_semantic_tokens(semantic.tokens);
+        out.abc_truncated = semantic.plan.truncated;
+        out.semantic_truncated = semantic.truncated;
+        return out;
+    }
+
+    runtime::AudioBuffer run(const Yue2Request & request, runtime::RunControl * control = nullptr) {
+        return run_detailed(request, control).audio;
     }
 
     void release_runtime_graphs() {
@@ -439,24 +469,36 @@ Yue2Plan Yue2PipelineRuntime::plan(const Yue2Request & request) {
     return impl_->plan(request);
 }
 
-Yue2SemanticResult Yue2PipelineRuntime::generate_semantic(const Yue2Request & request, Yue2Plan plan) {
-    return impl_->generate_semantic(request, std::move(plan));
+Yue2SemanticResult Yue2PipelineRuntime::generate_semantic(const Yue2Request & request,
+                                                          Yue2Plan plan,
+                                                          runtime::RunControl * control) {
+    return impl_->generate_semantic(request, std::move(plan), control);
 }
 
 std::vector<float> Yue2PipelineRuntime::synthesize_latents(
     const Yue2SemanticResult & semantic,
     const Yue2GenerationConfig & generation,
-    uint64_t seed) {
-    static const std::vector<float> empty_noise;
-    return impl_->synthesize_latents(semantic, generation, empty_noise, seed);
+    const std::vector<float> & noise,
+    uint64_t seed,
+    runtime::RunControl * control) {
+    // `noise` used to be dropped here: the wrapper passed a static empty vector,
+    // so anything driving the pipeline stage by stage silently lost the
+    // teacher-forced noise that nar_noise_file exists to supply.
+    return impl_->synthesize_latents(semantic, generation, noise, seed, control);
 }
 
-runtime::AudioBuffer Yue2PipelineRuntime::decode_audio(const std::vector<float> & latents, int64_t frames) {
-    return impl_->decode_audio(latents, frames);
+runtime::AudioBuffer Yue2PipelineRuntime::decode_audio(const std::vector<float> & latents,
+                                                      int64_t frames,
+                                                      runtime::RunControl * control) {
+    return impl_->decode_audio(latents, frames, control);
 }
 
-runtime::AudioBuffer Yue2PipelineRuntime::run(const Yue2Request & request) {
-    return impl_->run(request);
+Yue2RunOutput Yue2PipelineRuntime::run_detailed(const Yue2Request & request, runtime::RunControl * control) {
+    return impl_->run_detailed(request, control);
+}
+
+runtime::AudioBuffer Yue2PipelineRuntime::run(const Yue2Request & request, runtime::RunControl * control) {
+    return impl_->run(request, control);
 }
 
 void Yue2PipelineRuntime::release_runtime_graphs() {

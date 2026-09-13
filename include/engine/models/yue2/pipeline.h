@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/framework/runtime/run_control.h"
+
 #include "engine/framework/assets/tensor_source.h"
 #include "engine/framework/codecs/oobleck_audio_vae_runtime.h"
 #include "engine/framework/core/execution_context.h"
@@ -29,13 +31,24 @@ public:
     ~Yue2PipelineRuntime();
 
     Yue2Plan plan(const Yue2Request & request);
-    Yue2SemanticResult generate_semantic(const Yue2Request & request, Yue2Plan plan);
+    Yue2SemanticResult generate_semantic(const Yue2Request & request,
+                                         Yue2Plan plan,
+                                         runtime::RunControl * control = nullptr);
     std::vector<float> synthesize_latents(
         const Yue2SemanticResult & semantic,
         const Yue2GenerationConfig & generation,
-        uint64_t seed);
-    runtime::AudioBuffer decode_audio(const std::vector<float> & latents, int64_t frames);
-    runtime::AudioBuffer run(const Yue2Request & request);
+        const std::vector<float> & noise,
+        uint64_t seed,
+        runtime::RunControl * control = nullptr);
+    runtime::AudioBuffer decode_audio(const std::vector<float> & latents,
+                                      int64_t frames,
+                                      runtime::RunControl * control = nullptr);
+
+    // Everything the run produced: audio, the score the model wrote, and the
+    // semantic codes behind it. run() keeps returning just the audio so existing
+    // callers are untouched.
+    Yue2RunOutput run_detailed(const Yue2Request & request, runtime::RunControl * control = nullptr);
+    runtime::AudioBuffer run(const Yue2Request & request, runtime::RunControl * control = nullptr);
     void release_runtime_graphs();
 
 private:

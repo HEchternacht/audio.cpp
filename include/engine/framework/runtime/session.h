@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/framework/runtime/run_control.h"
+
 #include "engine/framework/core/backend.h"
 #include "engine/framework/debug/trace.h"
 
@@ -163,6 +165,18 @@ struct TaskRequest {
     std::optional<VoiceCondition> voice = std::nullopt;
     std::vector<VoiceArtifact> input_artifacts;
     std::unordered_map<std::string, std::string> options;
+
+    // Optional out-of-band control channel for this run: lets the caller cancel
+    // it and watch it progress. Null for every caller that does neither -- the
+    // CLI, the existing server, every test -- and ignored by every family that
+    // does not consult it, which is why this is a field rather than a parameter
+    // on run(). Adding a parameter would break all 74 run() overrides across the
+    // model families and make every one a permanent rebase conflict; a defaulted
+    // field is a one-line change that families adopt when they are ready.
+    //
+    // A model may only use it for the duration of the run() call it arrived on;
+    // it must not retain the pointer.
+    std::shared_ptr<RunControl> control = nullptr;
 };
 
 struct AudioPreparationContract {

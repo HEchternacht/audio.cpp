@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/framework/runtime/run_control.h"
+
 #include "engine/framework/assets/tensor_source.h"
 #include "engine/framework/core/backend_weight_store.h"
 #include "engine/framework/core/execution_context.h"
@@ -32,7 +34,8 @@ public:
         const std::vector<float> & noise,
         uint64_t seed,
         int64_t ode_steps,
-        int64_t context);
+        int64_t context,
+        runtime::RunControl * control = nullptr);
 
     void release_runtime_graphs();
 

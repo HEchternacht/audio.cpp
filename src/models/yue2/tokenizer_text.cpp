@@ -150,4 +150,8 @@ std::vector<int32_t> Yue2TextTokenizer::encode(const std::string & text) const {
     return vendor::tokenize_bpe(*vocab_, text, true);
 }
 
+std::string Yue2TextTokenizer::decode(const std::vector<int32_t> & ids, bool skip_special) const {
+    return vendor::decode_bpe(*vocab_, ids, skip_special);
+}
+
 }  // namespace engine::models::yue2

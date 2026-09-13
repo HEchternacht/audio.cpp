@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/framework/runtime/session.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -95,6 +97,20 @@ struct Yue2SemanticResult {
     Yue2Plan plan;
     std::vector<int32_t> tokens;
     bool truncated = false;
+};
+
+// Everything one run produced, not just the audio. The score is what makes the
+// model's documented editing workflow reachable -- read it, change a bar, send
+// it back as `abc` -- and the semantic codes are what make a continuation
+// possible, since they can be replayed as a prefix for the next run.
+struct Yue2RunOutput {
+    runtime::AudioBuffer audio;
+    std::string abc;
+    // Codec space, i.e. with kCodecOffset already removed, so these round-trip
+    // straight back into a request.
+    std::vector<int32_t> semantic_codes;
+    bool abc_truncated = false;
+    bool semantic_truncated = false;
 };
 
 const char * cot_mode_name(Yue2CotMode mode) noexcept;

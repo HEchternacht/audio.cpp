@@ -6,6 +6,7 @@
 #include "engine/framework/runtime/options.h"
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -230,8 +231,31 @@ runtime::TaskResult Yue2Session::run(const runtime::TaskRequest & request) {
     require_prepared("Yue2 run");
     const auto wall_start = Clock::now();
     const auto parsed = parse_yue2_request(request, assets_->config.generation);
+    auto out = pipeline_->run_detailed(parsed, request.control.get());
+
     runtime::TaskResult result;
-    result.audio_output = pipeline_->run(parsed);
+    result.audio_output = std::move(out.audio);
+
+    // The score the model wrote before it sang. Returning it is what turns a
+    // generation into something editable: change a bar, send it back as `abc`,
+    // and the same lyrics and style are re-rendered over the new score.
+    if (!out.abc.empty()) {
+        result.text_output = runtime::Transcript{out.abc, ""};
+    }
+
+    // The semantic codes behind that audio, offset already removed. A later
+    // request can replay them as a prefix to continue the take rather than
+    // starting over.
+    if (!out.semantic_codes.empty()) {
+        std::vector<std::byte> payload(out.semantic_codes.size() * sizeof(int32_t));
+        std::memcpy(payload.data(), out.semantic_codes.data(), payload.size());
+        result.output_artifacts.push_back(runtime::make_voice_artifact(
+            runtime::ArtifactKind::AcousticTokens,
+            "semantic_codes",
+            std::move(payload),
+            {{"count", std::to_string(out.semantic_codes.size())}, {"encoding", "i32le"}}));
+    }
+
     engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
     return result;
 }

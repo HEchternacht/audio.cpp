@@ -1,0 +1,817 @@
+openapi: 3.1.0
+
+info:
+  title: audiocpp-api
+  version: "1"
+  summary: Headless music generation and editing over HTTP.
+  description: |
+    Every request that touches a model becomes a **job**: submitted, queued, run
+    on a worker, and recorded on disk. Submission returns immediately with a job
+    id; the work happens afterwards and its record outlives the process.
+
+    Three properties shape the whole surface:
+
+    - **Nothing is lost.** A job's request is written verbatim before the model
+      runs, so lyrics, style and seed survive a crash, a kill or a restart. A job
+      that was running when the server died comes back as `interrupted` rather
+      than vanishing; one that was still queued is re-queued.
+    - **Runs can be stopped.** `POST /v1/jobs/{id}/cancel` reaches the model's
+      inner loop. There is no CUDA abort callback in ggml, so cancellation lands
+      at the next step boundary rather than instantly: tens of milliseconds
+      during token decoding, up to one full step during flow-matching or
+      decoding.
+    - **Capabilities are discoverable.** `GET /v1/capabilities` reports, per
+      configured model, what it can actually do. Families differ — `yue2` has no
+      audio input and edits through its symbolic score, while `ace_step` and
+      `stable_audio` take source audio — so a client should read this rather than
+      assume.
+
+  license:
+    name: MIT
+
+servers:
+  - url: http://127.0.0.1:8781
+    description: Local server
+
+tags:
+  - name: meta
+    description: Health and capability discovery.
+  - name: models
+    description: Which models are configured, and their residency.
+  - name: jobs
+    description: Submitting work, watching it, and reading it back.
+
+paths:
+  /health:
+    get:
+      tags: [meta]
+      summary: Liveness and a snapshot of the queue.
+      operationId: getHealth
+      responses:
+        "200":
+          description: The server is up.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /v1/capabilities:
+    get:
+      tags: [meta]
+      summary: What this server and its models can do.
+      description: |
+        The contract that lets a client be written without hardcoding family
+        names. Read `models[].accepts_audio_input` and `models[].notes` before
+        offering an editing operation: they are per-family truths, not server-wide
+        ones.
+      operationId: getCapabilities
+      responses:
+        "200":
+          description: Capability description.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Capabilities" }
+
+  /openapi.yaml:
+    get:
+      tags: [meta]
+      summary: This document, as served by the running build.
+      operationId: getOpenapi
+      responses:
+        "200":
+          description: The spec.
+          content:
+            application/yaml:
+              schema: { type: string }
+        "404":
+          description: The spec was not installed beside the binary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/models:
+    get:
+      tags: [models]
+      summary: List configured models.
+      operationId: listModels
+      responses:
+        "200":
+          description: Every model in the config, loaded or not.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, const: list }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Model" }
+
+  /v1/models/load:
+    post:
+      tags: [models]
+      summary: Load a model into memory now.
+      description: |
+        Synchronous, because a client needs a definite answer to draw a "loaded"
+        badge. Refused with 409 while that model has a job running: a load can
+        force an eviction, and evicting a model mid-inference would kill the run.
+      operationId: loadModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model: { type: string, examples: ["yue2-3b-q8"] }
+      responses:
+        "200":
+          description: Loaded.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  model: { type: string }
+                  loaded: { type: boolean }
+                  load_ms: { type: integer }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/models/unload:
+    post:
+      tags: [models]
+      summary: Release a model's memory.
+      operationId: unloadModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [model]
+                  properties:
+                    model: { type: string }
+                - type: object
+                  required: [all]
+                  properties:
+                    all:
+                      type: boolean
+                      description: Unload every model that is not running a job.
+      responses:
+        "200":
+          description: Unloaded.
+          content:
+            application/json:
+              schema: { type: object }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/jobs:
+    get:
+      tags: [jobs]
+      summary: Job history, filtered.
+      description: |
+        Served from an in-memory index, so paging costs no disk reads. Job ids are
+        ULIDs and therefore sort by creation time, which is why the cursor is a
+        plain id comparison with no offset scan and no skew when jobs are added
+        mid-page.
+      operationId: listJobs
+      parameters:
+        - name: status
+          in: query
+          description: Comma-separated statuses to include.
+          schema: { type: string, examples: ["succeeded,failed"] }
+        - name: model
+          in: query
+          schema: { type: string }
+        - name: family
+          in: query
+          schema: { type: string }
+        - name: operation
+          in: query
+          schema: { type: string }
+        - name: q
+          in: query
+          description: Case-insensitive substring over the request body and metadata — this is how you find a song by a line of its lyrics.
+          schema: { type: string }
+        - name: pinned
+          in: query
+          schema: { type: boolean }
+        - name: created_after
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: created_before
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: cursor
+          in: query
+          description: A job id from a previous page's next_cursor.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: order
+          in: query
+          schema: { type: string, enum: [desc, asc], default: desc }
+        - name: include_request
+          in: query
+          description: Off by default — request bodies carry full lyrics and scores.
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: A page of jobs.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+    post:
+      tags: [jobs]
+      summary: Submit a job.
+      description: |
+        One route for every operation. `operation` is a discriminator validated
+        against the chosen model's capabilities, so a family that gains an
+        operation tomorrow needs no change here and no change in a client that
+        reads `/v1/capabilities`.
+
+        The job is written to disk before this returns, so a crash between the
+        response and the worker picking it up still leaves a recoverable record.
+      operationId: submitJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/JobSubmission" }
+      responses:
+        "202":
+          description: Accepted and queued.
+          headers:
+            Location:
+              schema: { type: string }
+              description: The job's own URL.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/tasks:
+    post:
+      tags: [jobs]
+      summary: Submit a family-native request unchanged.
+      description: |
+        The escape hatch, taking the same body the synchronous server's
+        `/v1/tasks/run` accepts. Everything the job layer provides — the queue,
+        cancellation, persistence — applies, but nothing is interpreted, so a
+        model with no operation table is still reachable.
+      operationId: submitTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/JobSubmission" }
+      responses:
+        "202":
+          description: Accepted and queued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/jobs/{id}:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [jobs]
+      summary: One job, with its current progress.
+      operationId: getJob
+      responses:
+        "200":
+          description: The job.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [jobs]
+      summary: Pin a job, or change its metadata.
+      description: Only `pinned` and `metadata` are mutable. A pinned job is never collected.
+      operationId: patchJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pinned: { type: boolean }
+                metadata: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: The updated job.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [jobs]
+      summary: Delete a job and its outputs.
+      description: Refused while the job is queued or running — cancel it first.
+      operationId: deleteJob
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  deleted: { type: boolean }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/jobs/{id}/result:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [jobs]
+      summary: A finished job's outputs.
+      description: |
+        Artifact **descriptors**, never inline audio: a four-minute stereo track
+        is around 46 MB of WAV, and base64 in a JSON body would make it 61 MB.
+        Fetch the bytes from the `url` on each output.
+
+        A failed or cancelled job returns 200 with `error` populated — the result
+        of a failed job is its error, and making a client branch on two status
+        codes for that adds nothing.
+      operationId: getJobResult
+      responses:
+        "200":
+          description: The finished job.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Still queued or running.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/jobs/{id}/outputs/{name}:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+      - name: name
+        in: path
+        required: true
+        description: An output name from the job's `outputs` array.
+        schema: { type: string, examples: ["audio", "score", "semantic_codes", "result"] }
+    get:
+      tags: [jobs]
+      summary: Download one output.
+      description: |
+        The name is matched against the job's own recorded outputs and never used
+        to build a path, so a client cannot reach a file the job does not own.
+      operationId: getJobOutput
+      responses:
+        "200":
+          description: The bytes.
+          content:
+            audio/wav:
+              schema: { type: string, format: binary }
+            text/vnd.abc:
+              schema: { type: string }
+            application/json:
+              schema: { type: object }
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/jobs/{id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    post:
+      tags: [jobs]
+      summary: Stop a job.
+      description: |
+        A job that is still queued is cancelled synchronously and comes back 200
+        already terminal. A running job returns 202: the cancel reaches the model
+        at its next step boundary, and the terminal status follows.
+      operationId: cancelJob
+      responses:
+        "200":
+          description: It was queued; it is now cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "202":
+          description: It is running; the cancel has been delivered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Already finished.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/jobs/{id}/events:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+      - name: since
+        in: query
+        description: Replay from just after this sequence number.
+        schema: { type: integer, format: int64 }
+    get:
+      tags: [jobs]
+      summary: Live progress, as Server-Sent Events.
+      description: |
+        Replays what the ring still holds, then streams. A client attaching
+        mid-run sees the whole story rather than only what happens next; one
+        reconnecting can send `Last-Event-ID` and resume. If it fell further
+        behind than the ring goes, a comment line says how many events were
+        dropped rather than leaving a silent gap.
+
+        A comment (`: keepalive`) every 15 seconds keeps proxies and socket
+        timeouts from killing a stream that is simply waiting through a long
+        stage. The stream closes after the `done` event.
+      operationId: streamJobEvents
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: An event stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+              examples:
+                run:
+                  value: |
+                    event: status
+                    id: 1
+                    data: {"job":"job_01M2...","type":"status","status":"running"}
+
+                    event: progress
+                    id: 2
+                    data: {"job":"job_01M2...","type":"progress","stage":"score","step":48,"total":4096,"fraction":0.0117}
+
+                    event: done
+                    id: 91
+                    data: {"job":"job_01M2...","type":"done","status":"succeeded","result_url":"/v1/jobs/job_01M2.../result"}
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Too many concurrent subscribers.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/queue:
+    get:
+      tags: [jobs]
+      summary: What is running and what is waiting.
+      operationId: getQueue
+      responses:
+        "200":
+          description: Queue state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Queue" }
+
+components:
+  parameters:
+    JobId:
+      name: id
+      in: path
+      required: true
+      description: A job id, `job_` followed by a 26-character ULID.
+      schema:
+        type: string
+        pattern: "^job_[0-9A-HJKMNP-TV-Z]{26}$"
+        examples: ["job_01M2CFWZ8QMX3T7Y1H5S6EYPR1"]
+
+  responses:
+    BadRequest:
+      description: The request is malformed; the message names the offending field.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such job, model or output.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: |
+        The request was well-formed but the target is in the wrong state —
+        cancelling a finished job, deleting a running one, loading a model that is
+        in use. Distinct from 400 because there is nothing to fix in the request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unavailable:
+      description: Transient — the queue is full, or the model does not fit in memory. Retry later.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type]
+          properties:
+            message: { type: string }
+            type:
+              type: string
+              enum:
+                - invalid_request_error
+                - not_found
+                - conflict
+                - server_busy
+                - insufficient_memory
+                - server_error
+
+    JobStatus:
+      type: string
+      description: |
+        `interrupted` is deliberately distinct from `failed`: it means the server
+        died while the job was running. That is an operational fact rather than a
+        model fault, and it is the only terminal state for which offering
+        "resubmit" makes sense.
+      enum: [queued, running, succeeded, failed, cancelled, interrupted]
+
+    JobOutput:
+      type: object
+      properties:
+        name:
+          type: string
+          description: |
+            `audio` is the rendered track. `score` is the ABC the model composed
+            before singing — edit it and submit it back as `abc` to re-render the
+            same lyrics over new music. `semantic_codes` are the tokens behind the
+            audio, replayable as a prefix to continue a take. `result` is
+            everything else the model returned.
+          examples: ["audio", "score", "semantic_codes", "result"]
+        kind: { type: string, enum: [audio, score, codes, text, json, midi] }
+        content_type: { type: string }
+        bytes: { type: integer, format: int64 }
+        url: { type: string }
+        asset_id: { type: string }
+        sample_rate: { type: integer }
+        channels: { type: integer }
+        duration_seconds: { type: number }
+        count:
+          type: integer
+          description: Number of codes, for code blobs.
+        missing:
+          type: boolean
+          description: The record survived but the bytes did not.
+
+    JobProgress:
+      type: object
+      properties:
+        stage:
+          type: string
+          description: Family-specific; read `progress_stages` from /v1/capabilities.
+          examples: ["score", "semantic", "acoustic", "decode"]
+        step: { type: integer, format: int64 }
+        total:
+          type: integer
+          format: int64
+          description: 0 when the loop's length is not known in advance.
+        fraction: { type: number }
+        message: { type: string }
+
+    Job:
+      type: object
+      properties:
+        id: { type: string }
+        status: { $ref: "#/components/schemas/JobStatus" }
+        model: { type: string }
+        family: { type: string }
+        operation: { type: string }
+        priority: { type: integer }
+        created_ms: { type: integer, format: int64 }
+        updated_ms: { type: integer, format: int64 }
+        started_ms: { type: [integer, "null"], format: int64 }
+        finished_ms: { type: [integer, "null"], format: int64 }
+        queue_position:
+          type: [integer, "null"]
+          description: 0-based place in the queue; null once it is no longer waiting.
+        pinned: { type: boolean }
+        cancel_requested: { type: boolean }
+        terminal: { type: boolean }
+        progress: { $ref: "#/components/schemas/JobProgress" }
+        error:
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                message: { type: string }
+                type: { type: string }
+        metrics:
+          type: object
+          properties:
+            wall_ms: { type: number }
+            queue_ms: { type: number }
+            audio_seconds: { type: number }
+            rtf:
+              type: number
+              description: Wall time divided by audio produced. 3.5 means 3.5 s of compute per second of music.
+        outputs:
+          type: array
+          items: { $ref: "#/components/schemas/JobOutput" }
+        request:
+          type: object
+          description: The submitted body, verbatim. Omitted from list responses unless asked for.
+          additionalProperties: true
+        metadata:
+          type: object
+          description: Opaque to the server; echoed back and searchable.
+          additionalProperties: true
+        links:
+          type: object
+          properties:
+            self: { type: string }
+            events: { type: string }
+            result: { type: string }
+            cancel: { type: string }
+
+    JobList:
+      type: object
+      properties:
+        object: { type: string, const: list }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Job" }
+        total_matched: { type: integer }
+        next_cursor:
+          type: [string, "null"]
+          description: Pass back as `cursor`; null on the last page.
+
+    JobSubmission:
+      type: object
+      required: [model]
+      properties:
+        model: { type: string }
+        operation:
+          type: string
+          description: Validated against the model's capabilities.
+          examples: ["generate", "score_render", "continue"]
+        priority:
+          type: integer
+          default: 0
+          description: Higher runs first. Reserved; nothing sets it above 0 today.
+        idempotency_key: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+        request:
+          type: object
+          description: |
+            The family-native request. `text` carries lyrics; per-model settings
+            go under `options` as strings.
+          properties:
+            text: { type: string }
+            options:
+              type: object
+              additionalProperties: { type: string }
+          additionalProperties: true
+      examples:
+        - model: yue2-3b-q8
+          operation: generate
+          metadata: { title: "take 3" }
+          request:
+            text: "[verse]\nneon rain across the causeway\n"
+            options:
+              style: "dreamy synth pop, female vocal, 96 bpm"
+              cot: "full"
+              seed: "831001"
+        - model: yue2-3b-q8
+          operation: score_render
+          request:
+            text: "[verse]\nneon rain across the causeway\n"
+            options:
+              style: "the same, but half-time"
+              cot: "melody"
+              abc: "X:1\nT:Neon Rain\nM:4/4\nK:Amin\n..."
+
+    Model:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, const: model }
+        family: { type: string }
+        task: { type: string }
+        mode: { type: string }
+        path: { type: string }
+        loaded: { type: boolean }
+        lazy: { type: boolean }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, const: ok }
+        version: { type: string }
+        backend: { type: string }
+        device: { type: integer }
+        models: { type: integer }
+        models_loaded: { type: integer }
+        workers: { type: integer }
+        max_loaded_models: { type: integer }
+        uptime_ms: { type: integer, format: int64 }
+        data_dir: { type: string }
+        jobs:
+          type: object
+          properties:
+            queued: { type: integer }
+            running: { type: integer }
+            retained: { type: integer }
+
+    Capabilities:
+      type: object
+      properties:
+        api_version: { type: integer }
+        sse: { type: boolean }
+        server:
+          type: object
+          properties:
+            concurrency:
+              type: object
+              properties:
+                workers: { type: integer }
+                max_loaded_models: { type: integer }
+                max_queued: { type: integer }
+                note: { type: string }
+            cancellation:
+              type: object
+              properties:
+                supported: { type: boolean }
+                granularity: { type: string, examples: ["model_step"] }
+                note: { type: string }
+            persistence:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                retention_days: { type: integer }
+                max_jobs_retained: { type: integer }
+        models:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              family: { type: string }
+              task: { type: string }
+              mode: { type: string }
+              loaded: { type: boolean }
+              accepts_audio_input:
+                type: boolean
+                description: |
+                  False for yue2, which has no audio-conditioning path at all —
+                  its covers and edits go through an ABC score. True for ace_step
+                  and stable_audio, which take source audio.
+              notes: { type: string }
+              progress_stages:
+                type: array
+                items: { type: string }
+
+    Queue:
+      type: object
+      properties:
+        queued:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              model: { type: string }
+              priority: { type: integer }
+              position: { type: integer }
+        running:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              model: { type: string }
+              stage: { type: string }
+        capacity:
+          type: object
+          properties:
+            workers: { type: integer }
+            max_queued: { type: integer }

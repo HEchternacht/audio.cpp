@@ -2030,8 +2030,10 @@ add_executable(audiocpp_server
     app/server/http.cpp
     app/server/model_memory.cpp
     app/server/multipart.cpp
+    app/server/result_json.cpp
     app/server/runtime.cpp
     app/server/ui_assets.cpp
+    app/server/wav.cpp
     app/cli/args.cpp
     app/cli/request.cpp
     app/streaming/pcm_source.cpp
@@ -2050,6 +2052,43 @@ if (WIN32)
 endif()
 if (ENGINE_ENABLE_OPENMP)
     target_link_libraries(audiocpp_server PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# audiocpp_apiserver: headless job-queue API. Deliberately omits ui_assets.cpp
+# and every generated UI header -- that omission is the UI decoupling.
+add_executable(audiocpp_apiserver
+    app/common/build_info.cpp
+    app/apiserver/main.cpp
+    app/apiserver/api_config.cpp
+    app/apiserver/api_error.cpp
+    app/apiserver/api_handler.cpp
+    app/apiserver/event_bus.cpp
+    app/apiserver/job.cpp
+    app/apiserver/job_queue.cpp
+    app/apiserver/job_store.cpp
+    app/apiserver/job_view.cpp
+    app/apiserver/model_pool.cpp
+    app/apiserver/router.cpp
+    app/apiserver/worker_pool.cpp
+    app/server/base64.cpp
+    app/server/config.cpp
+    app/server/http.cpp
+    app/server/model_memory.cpp
+    app/server/result_json.cpp
+    app/server/wav.cpp
+    app/cli/args.cpp
+    app/cli/request.cpp
+)
+target_link_libraries(audiocpp_apiserver PRIVATE engine_runtime ggml)
+target_include_directories(audiocpp_apiserver PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/app/server"
+    "${CMAKE_CURRENT_SOURCE_DIR}/app/cli"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+if (WIN32)
+    target_link_libraries(audiocpp_apiserver PRIVATE ws2_32)
+endif()
+if (ENGINE_ENABLE_OPENMP)
+    target_link_libraries(audiocpp_apiserver PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 add_executable(audiocpp_gguf
@@ -2177,6 +2216,48 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         add_executable(${target} ${source})
         target_link_libraries(${target} PRIVATE engine_runtime ggml)
     endfunction()
+
+    # API server self-tests. Each source carries its own direct-execution entry
+    # point behind a file-specific macro, so a sibling linked in as a dependency
+    # never contributes a second main().
+    function(audiocpp_api_selftest name macro)
+        add_executable(apiselftest_${name} ${ARGN})
+        target_compile_definitions(apiselftest_${name} PRIVATE ${macro}=1)
+        target_include_directories(apiselftest_${name} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/app/server"
+            "${CMAKE_CURRENT_SOURCE_DIR}/app/apiserver")
+        target_link_libraries(apiselftest_${name} PRIVATE engine_runtime ggml)
+        if (WIN32)
+            target_link_libraries(apiselftest_${name} PRIVATE ws2_32)
+        endif()
+        add_test(NAME apiselftest_${name} COMMAND apiselftest_${name})
+        set_tests_properties(apiselftest_${name} PROPERTIES TIMEOUT 60)
+    endfunction()
+
+    audiocpp_api_selftest(wav AUDIOCPP_SELFTEST_WAV app/server/wav.cpp)
+    audiocpp_api_selftest(job AUDIOCPP_SELFTEST_JOB app/apiserver/job.cpp)
+    audiocpp_api_selftest(job_store AUDIOCPP_SELFTEST_JOB_STORE
+        app/apiserver/job_store.cpp app/apiserver/job.cpp)
+    audiocpp_api_selftest(job_queue AUDIOCPP_SELFTEST_JOB_QUEUE app/apiserver/job_queue.cpp)
+    audiocpp_api_selftest(worker_pool AUDIOCPP_SELFTEST_WORKER_POOL
+        app/apiserver/worker_pool.cpp app/apiserver/job_queue.cpp
+        app/apiserver/job_store.cpp app/apiserver/job.cpp)
+    audiocpp_api_selftest(event_bus AUDIOCPP_SELFTEST_EVENT_BUS app/apiserver/event_bus.cpp)
+    audiocpp_api_selftest(api_error AUDIOCPP_SELFTEST_API_ERROR
+        app/apiserver/api_error.cpp app/server/http.cpp)
+    audiocpp_api_selftest(router AUDIOCPP_SELFTEST_ROUTER
+        app/apiserver/router.cpp app/apiserver/api_error.cpp app/server/http.cpp)
+    audiocpp_api_selftest(job_view AUDIOCPP_SELFTEST_JOB_VIEW
+        app/apiserver/job_view.cpp app/apiserver/job_store.cpp app/apiserver/job.cpp
+        app/apiserver/api_error.cpp app/server/http.cpp)
+    audiocpp_api_selftest(model_pool AUDIOCPP_SELFTEST_MODEL_POOL
+        app/apiserver/model_pool.cpp app/server/model_memory.cpp app/server/config.cpp
+        app/cli/args.cpp app/cli/request.cpp)
+    audiocpp_api_selftest(api_config AUDIOCPP_SELFTEST_API_CONFIG
+        app/apiserver/api_config.cpp app/apiserver/model_pool.cpp
+        app/server/model_memory.cpp app/server/config.cpp
+        app/cli/args.cpp app/cli/request.cpp)
 
     if (ENGINE_BUILD_TESTS)
         add_executable(sentencepiece_tokenizer1_test
