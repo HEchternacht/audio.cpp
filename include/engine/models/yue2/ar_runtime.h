@@ -33,6 +33,12 @@ struct Yue2ArDevicePrefixState {
     std::vector<core::TensorValue> values;
 };
 
+// Bytes per element in the AR's KV cache on this backend. The VRAM budget has
+// to know it and the runtime is what decides it, so it is published here rather
+// than assumed on the other side of the codebase -- assuming f32 while the
+// accelerated backends quietly use f16 halves every window the budget allows.
+int64_t yue2_ar_cache_bytes_per_element(core::BackendType backend);
+
 class Yue2ArRuntime {
 public:
     Yue2ArRuntime(

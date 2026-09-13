@@ -117,15 +117,24 @@ The server handles this in two layers, and neither needs configuring:
    `oom_retries` (default 2) bounds this, so the worst case is a budget
    quartered rather than an endless loop. Each retry is logged.
 
-The semantic budget is split between the prefix and the tokens the stage will
-generate, because they do not cost the same. A prefix token costs a decode
-cache and nothing after that -- the acoustic stage is handed the music, never
-the planner's score -- while a generated token costs that cache and its share
-of the acoustic prefix-state graph. This matters most under `cot=full`, where
-the planner writes a score of hundreds to thousands of tokens: charged at the
-generated rate, that plan alone could exhaust a budget that holds it easily at
-the prefix rate, and the take collapsed to the 200-token floor (eight seconds)
-while the same request at `cot=off` ran for minutes.
+The budget is split between the prefix a run must carry and the tokens it will
+generate, because they buy different things. A prefix token is prefilled and
+held: it pays a cache, a share of a prefill graph sized to the whole prefix,
+and a prefix-state at the acoustic stage that keeps it as f32, bf16 and f16 at
+once. A generated token pays its cache and a share of the NAR graph arena, the
+largest single allocation in a run. Measured on the 3B, that is five caches per
+prefix token and six per generated token; the run's own peaks are logged per
+stage (`[yue2] semantic peak ... 2.95 caches`) so the weights can be rechecked
+against any card rather than trusted.
+
+This split matters most under `cot=full`, where the planner writes a score of
+hundreds to thousands of tokens that becomes the prefix. Charged at the
+generated rate, that plan alone exhausts a budget that holds it easily at the
+prefix rate, and the take collapses to the 200-token floor -- eight seconds --
+while the same request at `cot=off` runs for minutes.
+
+The cache is f16 on CUDA, HIP and Vulkan and f32 on CPU; `yue2_ar_cache_bytes_per_element`
+is the one place that decides it, and the budget reads it rather than assuming.
 
 Windows that were shortened appear in the job's `result` output under `notes`,
 so a short take on a small card says why rather than looking like the model

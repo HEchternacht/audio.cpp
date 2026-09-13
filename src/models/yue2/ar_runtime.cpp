@@ -23,6 +23,24 @@ using Clock = std::chrono::steady_clock;
 
 constexpr int64_t kArDecodeChunkTokens = 5120;
 
+}   // namespace
+
+int64_t yue2_ar_cache_bytes_per_element(core::BackendType backend) {
+    // The accelerated backends keep the static cache in f16; CPU keeps the f32
+    // default. This is the single place that decides it -- make_ar_config()
+    // reads it, and so does the VRAM budget in pipeline.cpp.
+    switch (backend) {
+        case core::BackendType::Cuda:
+        case core::BackendType::Hip:
+        case core::BackendType::Vulkan:
+            return 2;
+        default:
+            return 4;
+    }
+}
+
+namespace {
+
 struct GgmlContextDeleter {
     void operator()(ggml_context * ctx) const noexcept {
         if (ctx != nullptr) {
@@ -161,8 +179,7 @@ engine::modules::QwenCausalDecodeRuntimeConfig make_runtime_config(
     out.decoder.stack.runtime.static_cache.update_mode = engine::modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
     out.decoder.stack.runtime.static_cache.set_rows_mode =
         engine::modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
-    if (backend_type == core::BackendType::Cuda || backend_type == core::BackendType::Hip ||
-        backend_type == core::BackendType::Vulkan) {
+    if (yue2_ar_cache_bytes_per_element(backend_type) == 2) {
         out.decoder.static_cache_type = GGML_TYPE_F16;
     }
     out.decoder.logits_size = logits_size > 0 ? logits_size : config.vocab_size;

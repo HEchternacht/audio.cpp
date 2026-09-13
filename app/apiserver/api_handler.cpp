@@ -243,7 +243,11 @@ void ApiHandler::run_job(Job & job, const std::shared_ptr<engine::runtime::RunCo
                 // held back from it: holding back more than the device has left
                 // cannot shrink a window past zero, so that ladder flattens
                 // exactly when it is needed most.
-                scale = scale == 0.0 ? 0.5 : scale / 2.0;
+                // Halving on the first miss throws away far more than the miss
+                // was worth: a run that overshot by a hundred megabytes came
+                // back a third of its length. Step down instead, and only fall
+                // to halves once a gentle step has already failed.
+                scale = scale == 0.0 ? 0.75 : scale * 0.6;
                 task_request.options["vram_budget_scale"] = std::to_string(scale);
                 job.resolved_options["vram_budget_scale"] = std::to_string(scale);
                 std::cerr << "[api] job " << job.id << " ran out of device memory (" << message

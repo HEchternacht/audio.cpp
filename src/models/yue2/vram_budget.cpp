@@ -30,15 +30,15 @@ int64_t yue2_max_tokens_for(int64_t free_bytes, int64_t headroom_bytes,
 }
 
 int64_t yue2_generated_tokens_for(int64_t cache_tokens, int64_t prefix_tokens,
-                                  int64_t decode_caches, int64_t downstream_weight) {
-    if (cache_tokens <= 0 || decode_caches <= 0 || downstream_weight < 0 || prefix_tokens < 0) {
+                                  int64_t prefix_weight, int64_t generated_weight) {
+    if (cache_tokens <= 0 || prefix_weight <= 0 || generated_weight <= 0 || prefix_tokens < 0) {
         return 0;
     }
-    const int64_t left = cache_tokens - prefix_tokens * decode_caches;
+    const int64_t left = cache_tokens - prefix_tokens * prefix_weight;
     if (left <= 0) {
         return 0;
     }
-    return left / (decode_caches + downstream_weight);
+    return left / generated_weight;
 }
 
 Yue2StageWindow yue2_stage_window(const std::string & name, int64_t requested, int64_t cap) {
@@ -106,10 +106,10 @@ int main() {
            std::to_string(yue2_effective_headroom(978LL << 20, 2560LL << 20)), "512753664");
     record("yue2_effective_headroom", "free unmeasurable, request kept",
            std::to_string(yue2_effective_headroom(0, 640LL << 20)), "671088640");
-    record("yue2_max_tokens_for", "prefix-state weight, three caches a token",
+    record("yue2_max_tokens_for", "generated weight, six caches a token",
            std::to_string(yue2_max_tokens_for(1LL << 30, 256LL << 20, per_token, 1,
-                                              kYue2PrefixStateCostWeight)),
-           "1170");
+                                              kYue2GeneratedCostWeight)),
+           "585");
     record("yue2_max_tokens_for", "half scale after a retry",
            std::to_string(yue2_max_tokens_for(1LL << 30, 256LL << 20, per_token, 1,
                                               kYue2DecodeCostWeight, 0.5)),
@@ -123,24 +123,38 @@ int main() {
 
     {
         const auto window = yue2_stage_window("semantic_max_tokens", 9000, 4772);
-        // 10000 cache tokens, a 2600-token plan+lyrics prefix, no guidance, the
-    // acoustic stage charging 3: (10000 - 2600) / 4.
-    record("yue2_generated_tokens_for", "10000 cache tokens, 2600 prefix, 1 decode cache, 3 downstream",
-           std::to_string(yue2_generated_tokens_for(10000, 2600, 1, 3)), "1850");
-    // The same budget under guidance: the prefix is held twice and every
-    // generated token costs two caches plus the acoustic three.
-    record("yue2_generated_tokens_for", "same, guidance (2 decode caches)",
-           std::to_string(yue2_generated_tokens_for(10000, 2600, 2, 3)), "960");
+        // The measured budget on the 4050: (2840 - 640) MiB / 112 KiB = 20114
+    // single-cache tokens. Against the four runs the weights were fitted to,
+    // both successes must be admitted and both failures excluded.
+    const int64_t measured_budget = 20114;
+    record("yue2_generated_tokens_for", "measured budget, 970-token prefix",
+           std::to_string(yue2_generated_tokens_for(measured_budget, 970, kYue2PrefixCostWeight,
+                                                    kYue2GeneratedCostWeight)),
+           "2544");
+    record("yue2_generated_tokens_for", "admits the 2271-token run that succeeded at prefix 970",
+           std::to_string(yue2_generated_tokens_for(measured_budget, 970, kYue2PrefixCostWeight,
+                                                    kYue2GeneratedCostWeight) >= 2271),
+           "1");
+    record("yue2_generated_tokens_for", "measured budget, 2565-token prefix",
+           std::to_string(yue2_generated_tokens_for(measured_budget, 2565, kYue2PrefixCostWeight,
+                                                    kYue2GeneratedCostWeight)),
+           "1214");
+    record("yue2_generated_tokens_for", "admits the 614-token run that succeeded at prefix 2565",
+           std::to_string(yue2_generated_tokens_for(measured_budget, 2565, kYue2PrefixCostWeight,
+                                                    kYue2GeneratedCostWeight) >= 614),
+           "1");
+    record("yue2_generated_tokens_for", "excludes the 1866-token run that ran out at prefix 2565",
+           std::to_string(yue2_generated_tokens_for(measured_budget, 2565, kYue2PrefixCostWeight,
+                                                    kYue2GeneratedCostWeight) < 1866),
+           "1");
     record("yue2_generated_tokens_for", "no prefix",
-           std::to_string(yue2_generated_tokens_for(10000, 0, 1, 3)), "2500");
-    record("yue2_generated_tokens_for", "downstream free",
-           std::to_string(yue2_generated_tokens_for(10000, 2600, 1, 0)), "7400");
+           std::to_string(yue2_generated_tokens_for(12000, 0, 5, 6)), "2000");
     record("yue2_generated_tokens_for", "prefix alone exhausts the budget",
-           std::to_string(yue2_generated_tokens_for(2000, 2600, 1, 3)), "0");
+           std::to_string(yue2_generated_tokens_for(2000, 2600, 5, 6)), "0");
     record("yue2_generated_tokens_for", "unmeasurable budget",
-           std::to_string(yue2_generated_tokens_for(0, 100, 1, 3)), "0");
-    record("yue2_generated_tokens_for", "zero decode caches",
-           std::to_string(yue2_generated_tokens_for(10000, 0, 0, 3)), "0");
+           std::to_string(yue2_generated_tokens_for(0, 100, 5, 6)), "0");
+    record("yue2_generated_tokens_for", "zero generated weight",
+           std::to_string(yue2_generated_tokens_for(10000, 0, 5, 0)), "0");
 
     record("yue2_stage_window", "9000 requested, 4772 fits",
                std::to_string(window.tokens) + " clamped=" + (window.clamped ? "1" : "0"),

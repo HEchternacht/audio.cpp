@@ -10,7 +10,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <stdexcept>
 #include <utility>
 
@@ -174,18 +177,90 @@ public:
     int64_t vram_headroom_bytes = 640LL << 20;
     double vram_budget_scale = 1.0;
 
+    int64_t cache_bytes_per_token() const {
+        return yue2_cache_bytes_per_token(Yue2CacheDims{
+            assets->config.model.layers,
+            assets->config.model.kv_heads,
+            assets->config.model.head_dim,
+            yue2_ar_cache_bytes_per_element(execution->backend_type())});
+    }
+
     int64_t stage_token_cap(int64_t sequences, int64_t cost_weight) const {
         const Yue2CacheDims dims{
             assets->config.model.layers,
             assets->config.model.kv_heads,
             assets->config.model.head_dim,
-            4};
+            yue2_ar_cache_bytes_per_element(execution->backend_type())};
         const int64_t free_bytes = free_device_bytes();
         return yue2_max_tokens_for(free_bytes,
                                    yue2_effective_headroom(free_bytes, vram_headroom_bytes),
                                    yue2_cache_bytes_per_token(dims), sequences, cost_weight,
                                    vram_budget_scale);
     }
+
+    // What a stage cost at its worst moment, against what the budget charged
+    // it. Free memory after a stage tells you only what it kept; what decides
+    // whether a run survives is the peak, and the peak is visible only while
+    // the stage is still running. Sampling from a second thread catches it --
+    // every allocation involved is held for seconds, so 50 ms is ample -- and
+    // is the only way these weights stop being numbers I chose by hand.
+    void report_stage(const char * name, int64_t before, int64_t low, int64_t tokens) const {
+        if (before <= 0 || low <= 0 || tokens <= 0) {
+            return;
+        }
+        const int64_t peak = before - low;
+        const int64_t per_token = peak / tokens;
+        std::fprintf(stderr, "[yue2] %s peak %lld MiB over %lld tokens (%lld KiB/token, %.2f caches)\n",
+                     name, static_cast<long long>(peak >> 20), static_cast<long long>(tokens),
+                     static_cast<long long>(per_token >> 10),
+                     static_cast<double>(per_token) / static_cast<double>(cache_bytes_per_token()));
+        engine::debug::timing_log_scalar(std::string("yue2.peak.") + name, peak);
+        engine::debug::timing_log_scalar(std::string("yue2.peak_per_token.") + name, per_token);
+    }
+
+    class StageWatch {
+    public:
+        StageWatch(const Impl & owner, const char * name) : owner_(owner), name_(name) {
+            before_ = owner_.free_device_bytes();
+            low_.store(before_);
+            if (before_ <= 0) {
+                return;
+            }
+            sampler_ = std::thread([this] {
+                while (!stop_.load()) {
+                    const int64_t now = owner_.free_device_bytes();
+                    if (now > 0 && now < low_.load()) {
+                        low_.store(now);
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            });
+        }
+
+        // The token count a stage is charged against is often known only once it
+        // has finished, so it arrives late rather than at construction.
+        void charge(int64_t tokens) { tokens_ = tokens; }
+
+        ~StageWatch() {
+            stop_.store(true);
+            if (sampler_.joinable()) {
+                sampler_.join();
+            }
+            owner_.report_stage(name_, before_, low_.load(), tokens_);
+        }
+
+        StageWatch(const StageWatch &) = delete;
+        StageWatch & operator=(const StageWatch &) = delete;
+
+    private:
+        const Impl & owner_;
+        const char * name_;
+        int64_t before_ = 0;
+        int64_t tokens_ = 0;
+        std::atomic<int64_t> low_{0};
+        std::atomic<bool> stop_{false};
+        std::thread sampler_;
+    };
 
     // Applies a cap in place and records why, so a short take is explained
     // rather than mysterious. One line per stage, on stderr rather than the
@@ -259,7 +334,9 @@ public:
         // these caches are still resident and costs about three caches a token
         // doing it. Budgeting both together here is what lets the acoustic stage
         // run in one piece, which is the only way it sounds right.
-        const int64_t decode_caches = request_guidance_scale(request) == 1.0F ? 1 : 2;
+        // Guidance keeps a second sequence alive through the whole decode, so
+        // every token -- prefix and generated alike -- costs one more cache.
+        const int64_t guidance_extra = request_guidance_scale(request) == 1.0F ? 0 : 1;
         // The prefix is in this cache too, and under cot=full it is not small:
         // the planner's score is thousands of tokens long and every one of them
         // is prefilled before the first musical token is sampled. It costs a
@@ -272,19 +349,27 @@ public:
                               static_cast<int64_t>(neg.size()));
         const int64_t free_bytes = free_device_bytes();
         const int64_t cap = yue2_generated_tokens_for(stage_token_cap(1, kYue2DecodeCostWeight),
-                                                      prefix_tokens, decode_caches,
-                                                      kYue2PrefixStateCostWeight);
+                                                      prefix_tokens,
+                                                      kYue2PrefixCostWeight + guidance_extra,
+                                                      kYue2GeneratedCostWeight + guidance_extra);
         apply_cap("semantic_max_tokens", semantic.max_tokens, cap,
                   std::to_string(free_bytes >> 20) + " free MiB, " + std::to_string(prefix_tokens) +
-                      " prefix tokens, " + std::to_string(decode_caches) + " decode caches");
+                      " prefix tokens at " + std::to_string(kYue2PrefixCostWeight + guidance_extra) +
+                      " caches, " + std::to_string(kYue2GeneratedCostWeight + guidance_extra) +
+                      " per generated");
         semantic.max_tokens = std::max<int64_t>(semantic.min_tokens, semantic.max_tokens);
-        out.tokens = ar->generate_cfg(
-            out.plan.prefix,
-            neg,
-            semantic,
-            request_guidance_scale(request),
-            request.seed,
-            control);
+        {
+            StageWatch watch(*this, "semantic");
+            out.tokens = ar->generate_cfg(
+                out.plan.prefix,
+                neg,
+                semantic,
+                request_guidance_scale(request),
+                request.seed,
+                control);
+            // Charged against prefix + generated: that is what the cache holds.
+            watch.charge(prefix_tokens + static_cast<int64_t>(out.tokens.size()));
+        }
         engine::debug::timing_log_scalar("yue2.semantic.music_generate_ms", engine::debug::elapsed_ms(music_start));
         out.truncated = static_cast<int64_t>(out.tokens.size()) >= request.generation.semantic.max_tokens;
         engine::debug::timing_log_scalar("yue2.semantic.tokens", out.tokens.size());
@@ -317,6 +402,11 @@ public:
         // where the decision can still be made -- and this window is left at
         // whatever the caller asked for.
         const int64_t context = generation.context;
+        // Charged per generated token, the unit the semantic budget reserves on
+        // its behalf. This is the stage that actually runs out of memory, and
+        // until now it was the only one with no measurement at all.
+        StageWatch watch(*this, "acoustic");
+        watch.charge(static_cast<int64_t>(semantic.tokens.size()));
         return nar->synthesize(
             semantic.plan.prefix,
             codec,
