@@ -270,6 +270,13 @@ public:
         const auto fitted = yue2_stage_window(name, window, cap);
         std::fprintf(stderr, "[yue2] %s: %s, window %lld -> %lld\n", name, detail.c_str(),
                      static_cast<long long>(window), static_cast<long long>(fitted.tokens));
+        // The same line to whoever is waiting on the run. The server log has had
+        // it all along; the person waiting for a song has not, and this is the
+        // one number that explains a take being shorter than it was asked for.
+        if (active_control != nullptr) {
+            active_control->log(std::string(name) + ": " + detail + ", window " +
+                                std::to_string(window) + " -> " + std::to_string(fitted.tokens));
+        }
         if (!fitted.clamped) {
             return;
         }
@@ -305,6 +312,17 @@ public:
             const auto abc_start = Clock::now();
             auto abc = abc_window(request.generation);
             fit_stage("abc_max_tokens", abc.max_tokens, 1, kYue2DecodeCostWeight);
+            // A score is not paid for once. Every token of it is prefix for the
+            // singing that follows, at kYue2PrefixCostWeight caches each, and
+            // budgeting it only against its own decode cost is what let the
+            // planner write a score that left no room for the song at all.
+            // Half the budget, so the other half is still a song.
+            const int64_t plan_budget = stage_token_cap(1, kYue2DecodeCostWeight);
+            if (plan_budget > 0) {
+                apply_cap("abc_max_tokens", abc.max_tokens,
+                          (plan_budget / 2) / kYue2PrefixCostWeight,
+                          "half the token budget, so the singing still fits");
+            }
             out.plan.abc_ids = ar->generate(out.plan.prefix, abc, request.seed, control);
             engine::debug::timing_log_scalar("yue2.semantic.abc_generate_ms", engine::debug::elapsed_ms(abc_start));
             // Detokenise the plan the model just wrote. Until now these ids were
@@ -348,15 +366,28 @@ public:
             std::max<int64_t>(static_cast<int64_t>(out.plan.prefix.size()),
                               static_cast<int64_t>(neg.size()));
         const int64_t free_bytes = free_device_bytes();
-        const int64_t cap = yue2_generated_tokens_for(stage_token_cap(1, kYue2DecodeCostWeight),
+        const int64_t budget = stage_token_cap(1, kYue2DecodeCostWeight);
+        const int64_t cap = yue2_generated_tokens_for(budget,
                                                       prefix_tokens,
                                                       kYue2PrefixCostWeight + guidance_extra,
                                                       kYue2GeneratedCostWeight + guidance_extra);
-        apply_cap("semantic_max_tokens", semantic.max_tokens, cap,
-                  std::to_string(free_bytes >> 20) + " free MiB, " + std::to_string(prefix_tokens) +
-                      " prefix tokens at " + std::to_string(kYue2PrefixCostWeight + guidance_extra) +
-                      " caches, " + std::to_string(kYue2GeneratedCostWeight + guidance_extra) +
-                      " per generated");
+        const std::string detail =
+            std::to_string(free_bytes >> 20) + " free MiB, " + std::to_string(prefix_tokens) +
+            " prefix tokens at " + std::to_string(kYue2PrefixCostWeight + guidance_extra) +
+            " caches, " + std::to_string(kYue2GeneratedCostWeight + guidance_extra) +
+            " per generated";
+        if (budget > 0 && cap <= 0) {
+            // Zero means two different things -- "the budget could not be
+            // measured" and "the prefix alone does not fit" -- and a zero cap is
+            // read downstream as no cap at all. Conflating them is what let a
+            // long score run the full 9000 tokens and then die in the acoustic
+            // stage, twenty minutes in, having produced nothing. Sing the floor
+            // and say why instead.
+            apply_cap("semantic_max_tokens", semantic.max_tokens, semantic.min_tokens,
+                      detail + " -- the prefix alone does not fit, so only the floor is left");
+        } else {
+            apply_cap("semantic_max_tokens", semantic.max_tokens, cap, detail);
+        }
         semantic.max_tokens = std::max<int64_t>(semantic.min_tokens, semantic.max_tokens);
         {
             StageWatch watch(*this, "semantic");
@@ -516,6 +547,13 @@ public:
     }
 
     Yue2RunOutput run_detailed(const Yue2Request & request, runtime::RunControl * control = nullptr) {
+        // Held for the duration so the budget can speak without every helper
+        // below growing a parameter it would only pass along.
+        active_control = control;
+        struct Clear {
+            runtime::RunControl ** slot;
+            ~Clear() { *slot = nullptr; }
+        } clear{&active_control};
         budget_notes.clear();
         vram_headroom_bytes = request.generation.vram_headroom_mb << 20;
         vram_budget_scale = request.generation.vram_budget_scale;
@@ -621,6 +659,7 @@ private:
 
     core::ExecutionContext * execution = nullptr;
     std::vector<std::string> budget_notes;
+    runtime::RunControl * active_control = nullptr;
     std::shared_ptr<const Yue2Assets> assets;
     Yue2TextTokenizer tokenizer;
     assets::TensorStorageType model_weight_type = assets::TensorStorageType::Native;

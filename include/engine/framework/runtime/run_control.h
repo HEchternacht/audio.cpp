@@ -67,9 +67,26 @@ public:
         }
     }
 
+    // A line worth putting in front of a person *while* the run happens, as
+    // opposed to progress, which is a position. The case this exists for is
+    // "semantic_max_tokens reduced from 9000 to 3039 so its cache fits the free
+    // device memory": the run then produces two minutes instead of six, and
+    // until that line is visible the take looks mysteriously truncated. Install
+    // it like the progress sink, before the run starts.
+    void set_log_sink(std::function<void(const std::string &)> sink) {
+        log_sink_ = std::move(sink);
+    }
+
+    void log(const std::string & line) const {
+        if (log_sink_) {
+            log_sink_(line);
+        }
+    }
+
 private:
     std::atomic<bool> cancelled_{false};
     std::function<void(const ProgressEvent &)> sink_;
+    std::function<void(const std::string &)> log_sink_;
 };
 
 // Null-safe helpers, so a model's hot loop carries no branch of its own and a

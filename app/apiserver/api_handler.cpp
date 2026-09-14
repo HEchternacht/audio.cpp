@@ -198,7 +198,23 @@ void ApiHandler::publish_progress(const Job & job, const engine::runtime::Progre
                     now_ms());
 }
 
+void ApiHandler::publish_log(const std::string & job_id, const std::string & line) {
+    Value::Object payload;
+    payload["job"] = Value::make_string(job_id);
+    payload["type"] = Value::make_string("log");
+    payload["message"] = Value::make_string(line);
+    payload["at_ms"] = Value::make_number(static_cast<double>(now_ms()));
+    events_.publish(job_id, "log", engine::io::json::stringify(Value::make_object(std::move(payload))),
+                    now_ms());
+}
+
 void ApiHandler::run_job(Job & job, const std::shared_ptr<engine::runtime::RunControl> & control) {
+    // Why a take came out the length it did, while it is happening rather than
+    // buried in the result artifact afterwards.
+    if (control) {
+        const std::string id = job.id;
+        control->set_log_sink([this, id](const std::string & line) { publish_log(id, line); });
+    }
     // The request body is stored verbatim; rebuild the engine request from it so
     // a replay produces exactly what the original run did.
     const auto * request_json = job.request.find("request");

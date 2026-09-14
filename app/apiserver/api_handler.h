@@ -42,6 +42,7 @@ private:
     void run_job(Job & job, const std::shared_ptr<engine::runtime::RunControl> & control);
     void publish_status(const Job & job);
     void publish_progress(const Job & job, const engine::runtime::ProgressEvent & event);
+    void publish_log(const std::string & job_id, const std::string & line);
 
     minitts::server::HttpResponse handle_health(const minitts::server::HttpRequest &, const PathParams &);
     minitts::server::HttpResponse handle_capabilities(const minitts::server::HttpRequest &, const PathParams &);

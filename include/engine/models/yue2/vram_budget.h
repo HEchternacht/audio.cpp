@@ -53,19 +53,31 @@ int64_t yue2_effective_headroom(int64_t free_bytes, int64_t requested_headroom_b
 // arena, which is built for the chunk being solved and is the single largest
 // allocation in a run.
 //
-// Both numbers are measured, not chosen. On an RTX 4050 with ~2840 MiB free at
-// the semantic stage (weights already resident), holding back 640 MiB:
+// Both numbers are measured, not chosen -- by `report_stage`, which samples the
+// peak from a second thread while a stage is still running, since free memory
+// after a stage tells you only what it kept.
 //
-//   prefix 970,  generated 2271 -> succeeded   (90.8 s of audio)
-//   prefix 2565, generated 614  -> succeeded   (24.6 s)
-//   prefix 2565, generated 1866 -> out of memory on the NAR graph
-//   prefix 2565, generated 4387 -> out of memory on the AR prefix-state graph
+// On an RTX 4050, 3492 MiB free at the semantic stage, holding back 640 MiB,
+// 800 prefix tokens and 3039 generated:
 //
-// 5 and 6 are the smallest pair of whole weights that admits both successes and
-// excludes both failures. Being wrong here costs a run that has already spent
-// minutes, so where the data allows a range, take the conservative end.
+//   semantic peak 1086 MiB over 3839 tokens -> 2.59 caches/token (guidance on)
+//   acoustic peak 1834 MiB over 3039 tokens -> 5.52 caches/token
+//
+// Two different denominators, and that is the whole point. The semantic cache
+// holds prefix *and* generated, so its rate is what a prefix token costs. The
+// acoustic stage is handed the music and never the score, so its rate is what a
+// generated token costs -- and at 5.52 it is the binding constraint of the run.
+//
+// Hence 3 and 6: each the measured rate rounded up. The earlier pair charged a
+// prefix 5, nearly twice what one costs, which is why a `cot=full` score -- and
+// it is thousands of tokens -- consumed a budget that holds it comfortably.
+// Those weights were measured before the AR prefilled straight into the decode
+// cache; that change is what made the prefix cheap, and nothing re-derived them.
+//
+// Being wrong here costs a run that has already spent minutes, so where the data
+// allows a range, take the conservative end.
 constexpr int64_t kYue2DecodeCostWeight = 1;
-constexpr int64_t kYue2PrefixCostWeight = 5;
+constexpr int64_t kYue2PrefixCostWeight = 3;
 constexpr int64_t kYue2GeneratedCostWeight = 6;
 
 // The largest window that fits, for `sequences` concurrent caches -- guidance

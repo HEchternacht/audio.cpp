@@ -123,30 +123,50 @@ int main() {
 
     {
         const auto window = yue2_stage_window("semantic_max_tokens", 9000, 4772);
-        // The measured budget on the 4050: (2840 - 640) MiB / 112 KiB = 20114
-    // single-cache tokens. Against the four runs the weights were fitted to,
-    // both successes must be admitted and both failures excluded.
-    const int64_t measured_budget = 20114;
-    record("yue2_generated_tokens_for", "measured budget, 970-token prefix",
-           std::to_string(yue2_generated_tokens_for(measured_budget, 970, kYue2PrefixCostWeight,
+        // The measured budget on the 4050: (3492 - 640) MiB / 112 KiB = 26075
+    // single-cache tokens, over the run that produced the two peaks quoted in
+    // the header -- 800 prefix tokens, 3039 generated.
+    const int64_t measured_budget = 26075;
+
+    // The weights exist to cover what the stages were *measured* to cost, so
+    // that is what is asserted. Hundredths of a cache, to stay in integers.
+    record("cost_weights/prefix covers the measured semantic peak",
+           std::to_string(kYue2PrefixCostWeight * 100 >= 259), "1");
+    record("cost_weights/generated covers the measured acoustic peak",
+           std::to_string(kYue2GeneratedCostWeight * 100 >= 552), "1");
+    // And are not wastefully above it. A weight a whole cache clear of the
+    // measurement is a take materially shorter than the card can hold, which is
+    // the failure these numbers were wrong in for a long time.
+    record("cost_weights/prefix is not wasteful",
+           std::to_string(kYue2PrefixCostWeight * 100 <= 359), "1");
+    record("cost_weights/generated is not wasteful",
+           std::to_string(kYue2GeneratedCostWeight * 100 <= 652), "1");
+
+    record("yue2_generated_tokens_for", "measured budget, the 800-token prefix of that run",
+           std::to_string(yue2_generated_tokens_for(measured_budget, 800, kYue2PrefixCostWeight,
                                                     kYue2GeneratedCostWeight)),
-           "2544");
-    record("yue2_generated_tokens_for", "admits the 2271-token run that succeeded at prefix 970",
-           std::to_string(yue2_generated_tokens_for(measured_budget, 970, kYue2PrefixCostWeight,
-                                                    kYue2GeneratedCostWeight) >= 2271),
+           "3945");
+    record("yue2_generated_tokens_for", "admits the 3039 tokens that run actually sang",
+           std::to_string(yue2_generated_tokens_for(measured_budget, 800, kYue2PrefixCostWeight,
+                                                    kYue2GeneratedCostWeight) >= 3039),
            "1");
-    record("yue2_generated_tokens_for", "measured budget, 2565-token prefix",
+    // A cot=full score is thousands of tokens. It must leave a song behind it,
+    // not the 200-token floor: that collapse is the bug these weights caused.
+    record("yue2_generated_tokens_for", "a 2565-token score still leaves a song",
            std::to_string(yue2_generated_tokens_for(measured_budget, 2565, kYue2PrefixCostWeight,
-                                                    kYue2GeneratedCostWeight)),
-           "1214");
-    record("yue2_generated_tokens_for", "admits the 614-token run that succeeded at prefix 2565",
-           std::to_string(yue2_generated_tokens_for(measured_budget, 2565, kYue2PrefixCostWeight,
-                                                    kYue2GeneratedCostWeight) >= 614),
+                                                    kYue2GeneratedCostWeight) >= 2000),
            "1");
-    record("yue2_generated_tokens_for", "excludes the 1866-token run that ran out at prefix 2565",
-           std::to_string(yue2_generated_tokens_for(measured_budget, 2565, kYue2PrefixCostWeight,
-                                                    kYue2GeneratedCostWeight) < 1866),
-           "1");
+
+    // Zero is returned for two unrelated reasons, and `yue2_stage_window` reads
+    // a zero cap as "no cap". A caller that cannot tell them apart leaves the
+    // window at its full size and generates tokens the run cannot pay for --
+    // which is exactly what failed an acoustic stage twenty minutes in. The
+    // contract is pinned here so the trap stays visible.
+    record("yue2_stage_window", "a zero cap is not a cap",
+           std::to_string(yue2_stage_window("semantic_max_tokens", 9000, 0).tokens), "9000");
+    record("yue2_stage_window", "and is not reported as clamped either",
+           std::to_string(yue2_stage_window("semantic_max_tokens", 9000, 0).clamped), "0");
+
     record("yue2_generated_tokens_for", "no prefix",
            std::to_string(yue2_generated_tokens_for(12000, 0, 5, 6)), "2000");
     record("yue2_generated_tokens_for", "prefix alone exhausts the budget",
