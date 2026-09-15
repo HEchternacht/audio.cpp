@@ -488,6 +488,69 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Queue" }
 
+  /v1/uploads:
+    post:
+      tags: [jobs]
+      summary: Stage one file for a job to use as input.
+      description: |
+        The body is the file itself; there is one file per upload, so there is
+        nothing for a multipart envelope to separate. The name comes from the
+        query string and is scrubbed to something that cannot steer a path, so
+        the name that comes back is the one to use in the request -- it is not
+        always the one that went in.
+
+        A job then lists the id under `uploads`, and names the file the way the
+        upload reported it:
+
+        ```json
+        {"model":"sheetsage2","operation":"transcribe",
+         "uploads":["up_01M2..."],"request":{"audio":"take.wav"}}
+        ```
+
+        Paths never travel in a request. A filename that is absolute, carries a
+        drive letter, or contains `..` is refused: over HTTP those would read
+        whatever the server can reach.
+      operationId: createUpload
+      parameters:
+        - name: name
+          in: query
+          required: false
+          description: The file's name. Scrubbed; the response says what was kept.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+          audio/wav:
+            schema: { type: string, format: binary }
+      responses:
+        "201":
+          description: Stored, and ready to be named by a job.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name, bytes]
+                properties:
+                  id:
+                    type: string
+                    description: "`up_` followed by a 26-character ULID."
+                    pattern: "^up_[0-9A-HJKMNP-TV-Z]{26}$"
+                  name:
+                    type: string
+                    description: What to call the file in the job's request.
+                  bytes: { type: integer }
+              example:
+                id: up_01M2HPS2Z25P7B04HYR7FEE6S5
+                name: take.wav
+                bytes: 9576748
+        "400":
+          description: Empty body, or larger than `api.max_upload_mb`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
 components:
   parameters:
     JobId:

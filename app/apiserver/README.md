@@ -221,6 +221,30 @@ Full schemas in [`docs/openapi.yaml`](../../docs/openapi.yaml), also served from
 | `PATCH` | `/v1/jobs/{id}` | Pin it, or edit its metadata |
 | `DELETE` | `/v1/jobs/{id}` | Remove it and its files |
 | `GET` | `/v1/queue` | What is running and what is waiting |
+| `POST` | `/v1/uploads` | Stage one file for a job to use as input |
+
+### Paths never travel in a request
+
+Every filename a client sends has to name a file inside the job's own input
+directory: not absolute, no drive letter, no `..`. The CLI's rule is the
+opposite -- it hands an absolute path straight through -- and that is right for a
+CLI and an arbitrary file read over HTTP, on a server that binds a loopback port
+with `cors_origins: "*"`. Send a file first and use the name that comes back:
+
+```bash
+curl -s -X POST "http://127.0.0.1:8781/v1/uploads?name=take.wav"      -H 'Content-Type: audio/wav' --data-binary @take.wav
+# {"id":"up_01M2HPS2Z25P7B04HYR7FEE6S5","name":"take.wav","bytes":9576748}
+
+curl -s -X POST http://127.0.0.1:8781/v1/jobs -H 'Content-Type: application/json' -d '{
+  "model": "sheetsage2", "operation": "transcribe",
+  "uploads": ["up_01M2HPS2Z25P7B04HYR7FEE6S5"],
+  "request": {"audio": "take.wav"}
+}'
+```
+
+The worker copies the upload into `<job>/input/` before the request is built, so
+what a family opens is always a plain name in one directory the server owns.
+`api.max_upload_mb` caps a single file, and defaults to 128.
 
 Errors keep the shape the existing server uses:
 
@@ -340,6 +364,7 @@ differ, and the API does not paper over it.
 | Family | Audio input | Editing |
 |---|---|---|
 | `yue2` | **No** | Through the symbolic score: read the ABC, change it, re-render |
+| `sheetsage2` | Yes, and only | Reads a recording and writes it as a score; composes nothing |
 | `ace_step` | Yes | `cover`, `repaint`, `extract`, `lego`, `complete` — real region repaint |
 | `stable_audio` | Yes | init-audio and multi-region inpaint |
 
@@ -349,6 +374,22 @@ and there is no semantic tokenizer to turn audio into codes. So a yue2 "cover"
 means supplying an ABC score with a new style, and region repaint that rejoins
 the surrounding audio is not achievable for that family. It is achievable with
 `ace_step`, which is why the capability is reported per model.
+
+`sheetsage2` is the other half of that answer. It turns a recording into an ABC
+score -- melody, chords, beats, sections -- in the same dialect yue2 reads and
+writes, which is what makes a cover a round trip rather than a conversion:
+transcribe the recording, edit the score, then hand it back to yue2 with
+`cot=melody` and a style of your own. It reads audio and composes nothing, so it
+is `task: "midi"` and never appears as something to generate with.
+
+It wants its own directory. The family finds its weights by looking for the one
+GGUF where the model lives, so a folder holding several of them is ambiguous and
+refused by name:
+
+```json
+{ "id": "sheetsage2", "family": "sheetsage2", "task": "midi",
+  "path": "C:/cmodels/yui/SheetSage2-GGUF", "lazy": true }
+```
 
 ## Cancellation, honestly
 
