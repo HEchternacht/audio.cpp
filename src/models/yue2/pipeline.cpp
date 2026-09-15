@@ -204,10 +204,15 @@ public:
     // the stage is still running. Sampling from a second thread catches it --
     // every allocation involved is held for seconds, so 50 ms is ample -- and
     // is the only way these weights stop being numbers I chose by hand.
-    void report_stage(const char * name, int64_t before, int64_t low, int64_t tokens) const {
-        if (before <= 0 || low <= 0 || tokens <= 0) {
+    void report_stage(const char * name, int64_t before, int64_t low, int64_t tokens) {
+        if (before <= 0 || tokens <= 0) {
             return;
         }
+        // A stage that drove the device to nothing used to report a peak of
+        // zero and say nothing else, which read as "this stage was free" -- the
+        // opposite of what happened. Floor the low-water mark instead, so the
+        // peak is at least everything that was there.
+        low = low < 0 ? 0 : low;
         const int64_t peak = before - low;
         const int64_t per_token = peak / tokens;
         std::fprintf(stderr, "[yue2] %s peak %lld MiB over %lld tokens (%lld KiB/token, %.2f caches)\n",
@@ -216,11 +221,38 @@ public:
                      static_cast<double>(per_token) / static_cast<double>(cache_bytes_per_token()));
         engine::debug::timing_log_scalar(std::string("yue2.peak.") + name, peak);
         engine::debug::timing_log_scalar(std::string("yue2.peak_per_token.") + name, per_token);
+        // A stage that ran the device down to nothing did not necessarily fail:
+        // with the driver's system-memory fallback on, the allocation that no
+        // longer fits is served from host RAM instead, and the only symptom is
+        // wall time -- six times realtime where the same stage a thousand
+        // tokens shorter runs under one. The budget predicts the spills it
+        // knows about; this catches the ones it got wrong.
+        if (low < kSpillFloorBytes) {
+            report_spilling(name, low);
+        }
+    }
+
+    // Free device memory below which the driver is assumed to be serving
+    // allocations from host RAM. Nothing reports the fallback directly, so the
+    // floor it leaves behind is the only evidence there is.
+    static constexpr int64_t kSpillFloorBytes = 128LL << 20;
+
+    void report_spilling(const char * name, int64_t low_bytes) {
+        const std::string line =
+            std::string(name) + ": USING CPU/RAM -- device memory fell to " +
+            std::to_string(low_bytes >> 20) +
+            " MiB during this stage, so the driver served the rest from system RAM; that is why "
+            "this run is several times slower than its length alone would explain";
+        std::fprintf(stderr, "[yue2] %s\n", line.c_str());
+        if (active_control != nullptr) {
+            active_control->log(line);
+        }
+        budget_notes.push_back(line);
     }
 
     class StageWatch {
     public:
-        StageWatch(const Impl & owner, const char * name) : owner_(owner), name_(name) {
+        StageWatch(Impl & owner, const char * name) : owner_(owner), name_(name) {
             before_ = owner_.free_device_bytes();
             low_.store(before_);
             if (before_ <= 0) {
@@ -253,7 +285,7 @@ public:
         StageWatch & operator=(const StageWatch &) = delete;
 
     private:
-        const Impl & owner_;
+        Impl & owner_;
         const char * name_;
         int64_t before_ = 0;
         int64_t tokens_ = 0;
@@ -285,6 +317,28 @@ public:
         engine::debug::timing_log_scalar(std::string("yue2.budget.") + name, fitted.tokens);
     }
 
+    // A window that survived the cap is not always a window that fits: a
+    // sampling floor outranks the budget, and so does a caller who set one. The
+    // driver's system-memory fallback means such a run no longer dies -- it
+    // crawls instead, the difference paged over PCIe, several times slower for
+    // the whole stage. That is worth saying out loud while it happens rather
+    // than leaving someone to guess why a take is taking twenty minutes.
+    void warn_if_spilling(const char * name, int64_t window, int64_t cap) {
+        if (cap <= 0 || window <= cap) {
+            return;
+        }
+        const std::string line =
+            std::string(name) + ": USING CPU/RAM -- " + std::to_string(window) +
+            " tokens is above the " + std::to_string(cap) +
+            " that fit in device memory, so the driver spills the difference to system RAM; "
+            "expect this run to take several times longer";
+        std::fprintf(stderr, "[yue2] %s\n", line.c_str());
+        if (active_control != nullptr) {
+            active_control->log(line);
+        }
+        budget_notes.push_back(line);
+    }
+
     void fit_stage(const char * name, int64_t & window, int64_t sequences, int64_t cost_weight) {
         const int64_t free_bytes = free_device_bytes();
         apply_cap(name, window, stage_token_cap(sequences, cost_weight),
@@ -313,15 +367,18 @@ public:
             auto abc = abc_window(request.generation);
             fit_stage("abc_max_tokens", abc.max_tokens, 1, kYue2DecodeCostWeight);
             // A score is not paid for once. Every token of it is prefix for the
-            // singing that follows, at kYue2PrefixCostWeight caches each, and
-            // budgeting it only against its own decode cost is what let the
-            // planner write a score that left no room for the song at all.
-            // Half the budget, so the other half is still a song.
+            // singing that follows, and then prefix again for every acoustic
+            // chunk, which re-prefills the AR over score and chunk together.
+            // Since the acoustic stage was chunked that cost no longer falls on
+            // the song's length -- it falls on the chunk, and a score long
+            // enough drives the chunk down to a few seconds, where the overlap
+            // costs more than the music it carries.
             const int64_t plan_budget = stage_token_cap(1, kYue2DecodeCostWeight);
             if (plan_budget > 0) {
                 apply_cap("abc_max_tokens", abc.max_tokens,
-                          (plan_budget / 2) / kYue2PrefixCostWeight,
-                          "half the token budget, so the singing still fits");
+                          yue2_score_tokens_for(plan_budget,
+                                                static_cast<int64_t>(out.plan.prefix.size())),
+                          "the longest score that still leaves a 20-second acoustic chunk");
             }
             out.plan.abc_ids = ar->generate(out.plan.prefix, abc, request.seed, control);
             engine::debug::timing_log_scalar("yue2.semantic.abc_generate_ms", engine::debug::elapsed_ms(abc_start));
@@ -367,15 +424,23 @@ public:
                               static_cast<int64_t>(neg.size()));
         const int64_t free_bytes = free_device_bytes();
         const int64_t budget = stage_token_cap(1, kYue2DecodeCostWeight);
-        const int64_t cap = yue2_generated_tokens_for(budget,
-                                                      prefix_tokens,
-                                                      kYue2PrefixCostWeight + guidance_extra,
-                                                      kYue2GeneratedCostWeight + guidance_extra);
+        // Only this stage is charged against the length any more. The acoustic
+        // stage that follows is solved in chunks sized to the card, so what it
+        // costs stops depending on how long the take is -- and the two never
+        // hold the device at the same time, since the semantic cache is freed
+        // before the acoustic stage builds anything. Adding the two, which is
+        // what this did, reserved a peak through a stage that had already
+        // released it and then shortened the take to pay for it twice.
+        const int64_t semantic_cost =
+            kYue2SemanticTokenCost + guidance_extra * kYue2SemanticGuidanceCost;
+        const Yue2StageCost stages[] = {
+            Yue2StageCost{semantic_cost, semantic_cost, 0},
+        };
+        const int64_t cap = yue2_generated_tokens_for(budget, prefix_tokens, stages,
+                                                      static_cast<int64_t>(sizeof(stages) / sizeof(stages[0])));
         const std::string detail =
             std::to_string(free_bytes >> 20) + " free MiB, " + std::to_string(prefix_tokens) +
-            " prefix tokens at " + std::to_string(kYue2PrefixCostWeight + guidance_extra) +
-            " caches, " + std::to_string(kYue2GeneratedCostWeight + guidance_extra) +
-            " per generated";
+            " prefix tokens at " + std::to_string(semantic_cost) + " milli-caches each";
         if (budget > 0 && cap <= 0) {
             // Zero means two different things -- "the budget could not be
             // measured" and "the prefix alone does not fit" -- and a zero cap is
@@ -389,6 +454,8 @@ public:
             apply_cap("semantic_max_tokens", semantic.max_tokens, cap, detail);
         }
         semantic.max_tokens = std::max<int64_t>(semantic.min_tokens, semantic.max_tokens);
+        warn_if_spilling("semantic_max_tokens", prefix_tokens + semantic.max_tokens,
+                         cap > 0 ? prefix_tokens + cap : 0);
         {
             StageWatch watch(*this, "semantic");
             out.tokens = ar->generate_cfg(
@@ -423,20 +490,53 @@ public:
         if (codec.empty()) {
             throw std::runtime_error("Yue2 semantic generation produced no codec tokens");
         }
+        // The watch opens before the runtimes are built, not after: loading the
+        // NAR weights and rebuilding the AR the semantic stage released are
+        // both spent out of the same budget, and measuring from after them
+        // hides a fixed cost the budget then fails to reserve. On this card
+        // that omission was most of the margin the run was supposed to keep.
+        StageWatch watch(*this, "acoustic");
         ensure_nar();
         ensure_ar();
-        // Deliberately unbudgeted. Splitting the take into chunks is the one
-        // economy that is audible: each chunk is solved against its own window
-        // only, so the seams arrive as a lurch every few seconds. A take that is
-        // shorter but whole is worth more than a long one that is stitched, so
-        // the length is budgeted instead -- at the semantic stage, which is
-        // where the decision can still be made -- and this window is left at
-        // whatever the caller asked for.
+        // Chunked, and sized here rather than by the model's context window,
+        // which on this card is some five times what the memory allows. This
+        // used to be left unbudgeted on the grounds that splitting a take is
+        // audible -- each chunk was solved against the style prefix and nothing
+        // of the chunk before it, so the seams arrived as a lurch. Carrying an
+        // overlap through the solver and discarding its latents removes that
+        // reason, and with it the need to shorten every take until the whole of
+        // it fits the card at once.
         const int64_t context = generation.context;
+        const int64_t prefix_tokens = static_cast<int64_t>(semantic.plan.prefix.size());
+        const int64_t chunk_budget = stage_token_cap(1, kYue2DecodeCostWeight);
+        const int64_t fitted_chunk = yue2_acoustic_chunk_for(chunk_budget, prefix_tokens,
+                                                             kYue2AcousticOverlapTokens);
+        // A chunk of zero means the prefix alone does not fit, and the runtime
+        // below reads zero as "no limit" -- the same conflation that once let a
+        // score run to nine thousand tokens. Chunk at the floor instead and let
+        // the stage say it is spilling: a take split into pieces that each
+        // overflow a little is far cheaper than one piece that overflows
+        // entirely.
+        const int64_t max_chunk = fitted_chunk > 0 ? fitted_chunk : kYue2MinAcousticChunkTokens;
+        if (fitted_chunk <= 0) {
+            warn_if_spilling("acoustic", prefix_tokens + max_chunk, prefix_tokens);
+        }
+        const int64_t take = static_cast<int64_t>(codec.size());
+        if (take > max_chunk) {
+            const int64_t chunks = (take + max_chunk - 1) / max_chunk;
+            const std::string line =
+                "acoustic: solving " + std::to_string(take) + " frames in " +
+                std::to_string(chunks) + " chunks of at most " + std::to_string(max_chunk) +
+                ", each carrying " + std::to_string(kYue2AcousticOverlapTokens) +
+                " frames of the one before it, so the take fits device memory whole";
+            std::fprintf(stderr, "[yue2] %s\n", line.c_str());
+            if (active_control != nullptr) {
+                active_control->log(line);
+            }
+        }
         // Charged per generated token, the unit the semantic budget reserves on
         // its behalf. This is the stage that actually runs out of memory, and
         // until now it was the only one with no measurement at all.
-        StageWatch watch(*this, "acoustic");
         watch.charge(static_cast<int64_t>(semantic.tokens.size()));
         return nar->synthesize(
             semantic.plan.prefix,
@@ -448,6 +548,8 @@ public:
             seed,
             generation.ode_steps,
             context,
+            max_chunk,
+            kYue2AcousticOverlapTokens,
             control);
     }
 

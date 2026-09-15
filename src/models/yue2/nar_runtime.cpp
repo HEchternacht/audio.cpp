@@ -172,14 +172,33 @@ std::shared_ptr<const Yue2NarWeights> load_nar_weights(
     return weights;
 }
 
-std::vector<std::pair<int64_t, int64_t>> chunk_ranges(int64_t frames, int64_t prefix_tokens, int64_t context) {
-    const int64_t chunk = std::min((context - prefix_tokens - 3) / 2, context);
+// One piece of the take as the solver sees it: `solve_begin`..`end` is the span
+// whose latents are kept, `context_begin` starts earlier by the overlap and is
+// solved only so the kept frames know what came before them. The first piece
+// has nothing before it, so its two beginnings coincide.
+struct NarChunk {
+    int64_t context_begin = 0;
+    int64_t solve_begin = 0;
+    int64_t end = 0;
+};
+
+std::vector<NarChunk> chunk_ranges(int64_t frames, int64_t prefix_tokens, int64_t context,
+                                   int64_t max_chunk_frames, int64_t overlap_frames) {
+    // The model's own ceiling: prefix, the chunk and its mirror all share one
+    // context window. The memory ceiling is the caller's, and on a small card it
+    // is far the lower of the two.
+    int64_t chunk = std::min((context - prefix_tokens - 3) / 2, context);
+    if (max_chunk_frames > 0) {
+        chunk = std::min(chunk, max_chunk_frames);
+    }
     if (frames < 1 || chunk < 1) {
         throw std::runtime_error("Yue2 NAR chunk leaves no acoustic context");
     }
-    std::vector<std::pair<int64_t, int64_t>> out;
+    const int64_t overlap = std::max<int64_t>(0, std::min(overlap_frames, chunk - 1));
+    std::vector<NarChunk> out;
     for (int64_t begin = 0; begin < frames; begin += chunk) {
-        out.push_back({begin, std::min(begin + chunk, frames)});
+        const int64_t end = std::min(begin + chunk, frames);
+        out.push_back({std::max<int64_t>(0, begin - overlap), begin, end});
     }
     return out;
 }
@@ -657,10 +676,14 @@ struct Yue2NarRuntime::Impl {
         uint64_t seed,
         int64_t ode_steps,
         int64_t context,
+        int64_t max_chunk_frames,
+        int64_t overlap_frames,
         runtime::RunControl * control = nullptr) {
         const auto total_start = Clock::now();
         const auto & config = assets->config.model;
-        const auto ranges = chunk_ranges(static_cast<int64_t>(codec.size()), static_cast<int64_t>(prefix.size()), context);
+        const auto ranges = chunk_ranges(static_cast<int64_t>(codec.size()),
+                                         static_cast<int64_t>(prefix.size()), context,
+                                         max_chunk_frames, overlap_frames);
         engine::debug::timing_log_scalar("yue2.nar.synthesize.prefix_tokens", prefix.size());
         engine::debug::timing_log_scalar("yue2.nar.synthesize.codec_tokens", codec.size());
         engine::debug::timing_log_scalar("yue2.nar.synthesize.chunks", ranges.size());
@@ -688,18 +711,18 @@ struct Yue2NarRuntime::Impl {
         double prefill_ms = 0.0;
         double solve_ms = 0.0;
         double append_ms = 0.0;
-        for (const auto & [begin, end] : ranges) {
+        for (const auto & range : ranges) {
             const auto token_start = Clock::now();
             std::vector<int32_t> ar_tokens = prefix;
-            ar_tokens.reserve(prefix.size() + static_cast<size_t>(end - begin) + 1);
-            for (int64_t i = begin; i < end; ++i) {
+            ar_tokens.reserve(prefix.size() + static_cast<size_t>(range.end - range.context_begin) + 1);
+            for (int64_t i = range.context_begin; i < range.end; ++i) {
                 ar_tokens.push_back(codec[static_cast<size_t>(i)] + kCodecOffset);
             }
             ar_tokens.push_back(kMusicEndToken);
             token_build_ms += engine::debug::elapsed_ms(token_start);
             const auto slice_start = Clock::now();
-            const size_t begin_elem = static_cast<size_t>(begin * config.latent_dim);
-            const size_t end_elem = static_cast<size_t>(end * config.latent_dim);
+            const size_t begin_elem = static_cast<size_t>(range.context_begin * config.latent_dim);
+            const size_t end_elem = static_cast<size_t>(range.end * config.latent_dim);
             std::vector<float> noise(end_elem - begin_elem);
             std::copy(full_noise.begin() + static_cast<std::ptrdiff_t>(begin_elem),
                       full_noise.begin() + static_cast<std::ptrdiff_t>(end_elem),
@@ -712,7 +735,13 @@ struct Yue2NarRuntime::Impl {
             auto chunk = solve_chunk(ar_state, noise, ode_steps, control);
             solve_ms += engine::debug::elapsed_ms(solve_start);
             const auto append_start = Clock::now();
-            out.insert(out.end(), chunk.begin(), chunk.end());
+            // The overlap was solved for its influence on what follows, not for
+            // its own sake: those frames already exist, from the chunk that
+            // owned them, and keeping this second version of them would be the
+            // seam rather than the cure for it.
+            const size_t keep_from =
+                static_cast<size_t>((range.solve_begin - range.context_begin) * config.latent_dim);
+            out.insert(out.end(), chunk.begin() + static_cast<std::ptrdiff_t>(keep_from), chunk.end());
             append_ms += engine::debug::elapsed_ms(append_start);
         }
         engine::debug::timing_log_scalar("yue2.nar.synthesize.token_build_ms", token_build_ms);
@@ -755,8 +784,11 @@ std::vector<float> Yue2NarRuntime::synthesize(
     uint64_t seed,
     int64_t ode_steps,
     int64_t context,
+    int64_t max_chunk_frames,
+    int64_t overlap_frames,
     runtime::RunControl * control) {
-    return impl_->synthesize(prefix, codec, prefill_state, noise, seed, ode_steps, context, control);
+    return impl_->synthesize(prefix, codec, prefill_state, noise, seed, ode_steps, context,
+                             max_chunk_frames, overlap_frames, control);
 }
 
 void Yue2NarRuntime::release_runtime_graphs() {

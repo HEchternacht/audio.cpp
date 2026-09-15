@@ -30,15 +30,53 @@ int64_t yue2_max_tokens_for(int64_t free_bytes, int64_t headroom_bytes,
 }
 
 int64_t yue2_generated_tokens_for(int64_t cache_tokens, int64_t prefix_tokens,
-                                  int64_t prefix_weight, int64_t generated_weight) {
-    if (cache_tokens <= 0 || prefix_weight <= 0 || generated_weight <= 0 || prefix_tokens < 0) {
+                                  const Yue2StageCost * stages, int64_t stage_count) {
+    if (cache_tokens <= 0 || prefix_tokens < 0 || stages == nullptr || stage_count <= 0) {
         return 0;
     }
-    const int64_t left = cache_tokens - prefix_tokens * prefix_weight;
+    int64_t answer = -1;
+    for (int64_t i = 0; i < stage_count; ++i) {
+        const Yue2StageCost & stage = stages[i];
+        if (stage.generated_cost <= 0) {
+            return 0;
+        }
+        const int64_t budget = (cache_tokens - stage.fixed_tokens) * kYue2CostScale -
+                               prefix_tokens * stage.prefix_cost;
+        const int64_t tokens = budget <= 0 ? 0 : budget / stage.generated_cost;
+        if (answer < 0 || tokens < answer) {
+            answer = tokens;
+        }
+    }
+    return answer < 0 ? 0 : answer;
+}
+
+int64_t yue2_acoustic_chunk_for(int64_t cache_tokens, int64_t prefix_tokens,
+                                int64_t overlap_tokens) {
+    if (cache_tokens <= 0 || prefix_tokens < 0 || overlap_tokens < 0) {
+        return 0;
+    }
+    const int64_t left = (cache_tokens - kYue2AcousticFixedTokens) * kYue2CostScale -
+                         (prefix_tokens + overlap_tokens) * kYue2AcousticPrefixCost;
     if (left <= 0) {
         return 0;
     }
-    return left / generated_weight;
+    return left / kYue2AcousticGeneratedCost;
+}
+
+int64_t yue2_score_tokens_for(int64_t cache_tokens, int64_t base_prefix_tokens) {
+    if (cache_tokens <= 0 || base_prefix_tokens < 0) {
+        return 0;
+    }
+    const int64_t acoustic_budget =
+        cache_tokens - kYue2SemanticRetentionTokens - kYue2AcousticFixedTokens;
+    const int64_t spendable =
+        acoustic_budget * kYue2CostScale - kYue2MinAcousticChunkTokens * kYue2AcousticGeneratedCost;
+    if (spendable <= 0) {
+        return 0;
+    }
+    const int64_t prefix = spendable / kYue2AcousticPrefixCost;
+    const int64_t score = prefix - base_prefix_tokens - kYue2AcousticOverlapTokens;
+    return score > 0 ? score : 0;
 }
 
 Yue2StageWindow yue2_stage_window(const std::string & name, int64_t requested, int64_t cap) {
@@ -106,10 +144,6 @@ int main() {
            std::to_string(yue2_effective_headroom(978LL << 20, 2560LL << 20)), "512753664");
     record("yue2_effective_headroom", "free unmeasurable, request kept",
            std::to_string(yue2_effective_headroom(0, 640LL << 20)), "671088640");
-    record("yue2_max_tokens_for", "generated weight, six caches a token",
-           std::to_string(yue2_max_tokens_for(1LL << 30, 256LL << 20, per_token, 1,
-                                              kYue2GeneratedCostWeight)),
-           "585");
     record("yue2_max_tokens_for", "half scale after a retry",
            std::to_string(yue2_max_tokens_for(1LL << 30, 256LL << 20, per_token, 1,
                                               kYue2DecodeCostWeight, 0.5)),
@@ -121,41 +155,166 @@ int main() {
                                               per_token, 1)),
            "2235");
 
+    // Every budget below is what the card actually had at that stage, less the
+    // 256 MiB of headroom: free MiB * 1024 / 112.
+    const int64_t budget_3492 = 29586;   // cot=off, semantic stage
+    const int64_t budget_3434 = 29057;   // cot=off, the run that was measured twice
+    const int64_t budget_3228 = 27173;   // cot=full, after the planner stage
+
+    // Each cost exists to cover what its stage was *measured* to spend, so that
+    // is what is asserted, in the same thousandths the constants are written in.
+    record("stage_costs", "semantic covers its measured peak",
+           std::to_string(kYue2SemanticTokenCost >= 1950), "1");
+    record("stage_costs", "acoustic prefix covers its measured rate",
+           std::to_string(kYue2AcousticPrefixCost >= 3650), "1");
+    record("stage_costs", "acoustic generated covers its measured rate",
+           std::to_string(kYue2AcousticGeneratedCost >= 4210), "1");
+    // And are not wastefully above it. A cost a whole cache clear of the
+    // measurement is half a minute of song this card could have sung, which is
+    // what these numbers were wrong in for a long time.
+    record("stage_costs", "semantic is not wasteful",
+           std::to_string(kYue2SemanticTokenCost <= 2950), "1");
+    record("stage_costs", "acoustic prefix is not wasteful",
+           std::to_string(kYue2AcousticPrefixCost <= 4650), "1");
+    record("stage_costs", "acoustic generated is not wasteful",
+           std::to_string(kYue2AcousticGeneratedCost <= 5210), "1");
+
+    const Yue2StageCost measured_stages[] = {
+        Yue2StageCost{kYue2SemanticTokenCost, kYue2SemanticTokenCost, 0},
+        Yue2StageCost{kYue2AcousticPrefixCost, kYue2AcousticGeneratedCost, kYue2AcousticFixedTokens},
+    };
+    constexpr int64_t kMeasuredStageCount = 2;
+
+    // What the acoustic model predicts, against four runs it was fitted to only
+    // two of. Peaks in MiB, one cache being 112 KiB.
+    auto acoustic_mib = [](int64_t prefix, int64_t generated) {
+        const int64_t tokens =
+            kYue2AcousticFixedTokens +
+            (prefix * kYue2AcousticPrefixCost + generated * kYue2AcousticGeneratedCost) /
+                kYue2CostScale;
+        return tokens * 112 / 1024;
+    };
+    auto within = [](int64_t predicted, int64_t measured) {
+        const int64_t slack = measured / 20;   // five per cent either way
+        return std::to_string(predicted >= measured - slack && predicted <= measured + slack);
+    };
+    record("stage_costs", "predicts the 2774 MiB peak of 800 prefix, 3000 generated",
+           within(acoustic_mib(800, 3000), 2774), "1");
+    record("stage_costs", "predicts the 3198 MiB peak of 4748 prefix, 500 generated",
+           within(acoustic_mib(4748, 500), 3198), "1");
+
+    // And -- the point of the whole exercise -- it admits the takes that ran at
+    // full speed and refuses the two that filled the card and were paged to
+    // system RAM. Those two are why the fixed cost is nearly a gigabyte: both
+    // overshot by about 330 MiB, which is what the unmeasured runtime setup
+    // came to once it was finally measured.
+    record("yue2_generated_tokens_for", "admits the 3000-token take that ran at 0.83 realtime",
+           std::to_string(yue2_generated_tokens_for(budget_3434, 800, measured_stages,
+                                                    kMeasuredStageCount) >= 3000),
+           "1");
+    record("yue2_generated_tokens_for", "refuses the 5152-token take that spilled",
+           std::to_string(yue2_generated_tokens_for(budget_3492, 800, measured_stages,
+                                                    kMeasuredStageCount) < 5152),
+           "1");
+    record("yue2_generated_tokens_for", "refuses the 4079-token cot=full take that spilled",
+           std::to_string(yue2_generated_tokens_for(budget_3228, 1394, measured_stages,
+                                                    kMeasuredStageCount) < 4079),
+           "1");
+    // The stages run one after another, so the answer is the one that binds and
+    // never their sum. Adding them is what reserved the semantic peak through a
+    // stage that had already freed it, and cost a third of every take.
+    record("yue2_generated_tokens_for", "the binding stage decides, not the sum",
+           std::to_string(yue2_generated_tokens_for(budget_3492, 800, measured_stages,
+                                                    kMeasuredStageCount)),
+           "3904");
     {
-        const auto window = yue2_stage_window("semantic_max_tokens", 9000, 4772);
-        // The measured budget on the 4050: (3492 - 640) MiB / 112 KiB = 26075
-    // single-cache tokens, over the run that produced the two peaks quoted in
-    // the header -- 800 prefix tokens, 3039 generated.
-    const int64_t measured_budget = 26075;
+        // A semantic stage made expensive enough to bind instead.
+        const Yue2StageCost lopsided[] = {
+            Yue2StageCost{20000, 20000, 0},
+            Yue2StageCost{kYue2AcousticPrefixCost, kYue2AcousticGeneratedCost, kYue2AcousticFixedTokens},
+        };
+        record("yue2_generated_tokens_for", "and it is whichever stage is dearest",
+               std::to_string(yue2_generated_tokens_for(20000, 0, lopsided, 2)), "1000");
+    }
 
-    // The weights exist to cover what the stages were *measured* to cost, so
-    // that is what is asserted. Hundredths of a cache, to stay in integers.
-    record("cost_weights/prefix covers the measured semantic peak",
-           std::to_string(kYue2PrefixCostWeight * 100 >= 259), "1");
-    record("cost_weights/generated covers the measured acoustic peak",
-           std::to_string(kYue2GeneratedCostWeight * 100 >= 552), "1");
-    // And are not wastefully above it. A weight a whole cache clear of the
-    // measurement is a take materially shorter than the card can hold, which is
-    // the failure these numbers were wrong in for a long time.
-    record("cost_weights/prefix is not wasteful",
-           std::to_string(kYue2PrefixCostWeight * 100 <= 359), "1");
-    record("cost_weights/generated is not wasteful",
-           std::to_string(kYue2GeneratedCostWeight * 100 <= 652), "1");
+    // A capped score must leave a song behind it. Uncapped, the 3948 tokens this
+    // card writes by default cost the acoustic stage 2.1 GiB on their own.
+    {
+        const int64_t score = yue2_score_tokens_for(budget_3492, 810);
+        record("yue2_score_tokens_for", "the score a 20-second chunk floor allows",
+               std::to_string(score), "649");
+        // The cap exists to keep the chunk workable once the semantic stage has
+        // taken its share, so that is what is checked: against the budget the
+        // acoustic stage will actually see, the chunk is still at its floor.
+        const int64_t acoustic_budget = budget_3492 - kYue2SemanticRetentionTokens;
+        record("yue2_score_tokens_for", "at the cap the chunk is still at its floor",
+               std::to_string(yue2_acoustic_chunk_for(acoustic_budget, 810 + score,
+                                                      kYue2AcousticOverlapTokens) >=
+                              kYue2MinAcousticChunkTokens),
+               "1");
+        record("yue2_score_tokens_for", "and one token past it is not",
+               std::to_string(yue2_acoustic_chunk_for(acoustic_budget, 810 + score + 1,
+                                                      kYue2AcousticOverlapTokens) <
+                              kYue2MinAcousticChunkTokens),
+               "1");
+        // The 3083-token score that sizing against the planner stage let through
+        // could not be prefilled by the acoustic stage at all.
+        record("yue2_score_tokens_for", "the score sized against the planner stage fit nothing",
+               std::to_string(yue2_acoustic_chunk_for(acoustic_budget, 810 + 3083,
+                                                      kYue2AcousticOverlapTokens)),
+               "0");
+        record("yue2_score_tokens_for", "unmeasurable budget",
+               std::to_string(yue2_score_tokens_for(0, 810)), "0");
+    }
 
-    record("yue2_generated_tokens_for", "measured budget, the 800-token prefix of that run",
-           std::to_string(yue2_generated_tokens_for(measured_budget, 800, kYue2PrefixCostWeight,
-                                                    kYue2GeneratedCostWeight)),
-           "3945");
-    record("yue2_generated_tokens_for", "admits the 3039 tokens that run actually sang",
-           std::to_string(yue2_generated_tokens_for(measured_budget, 800, kYue2PrefixCostWeight,
-                                                    kYue2GeneratedCostWeight) >= 3039),
-           "1");
-    // A cot=full score is thousands of tokens. It must leave a song behind it,
-    // not the 200-token floor: that collapse is the bug these weights caused.
-    record("yue2_generated_tokens_for", "a 2565-token score still leaves a song",
-           std::to_string(yue2_generated_tokens_for(measured_budget, 2565, kYue2PrefixCostWeight,
-                                                    kYue2GeneratedCostWeight) >= 2000),
-           "1");
+    // Chunking is what takes the take's own length out of the acoustic budget.
+    // What is left over after the fixed cost and the prefix decides how long one
+    // piece may be, and the piece is the same length whether the song runs two
+    // minutes or ten.
+    {
+        const int64_t chunk = yue2_acoustic_chunk_for(budget_3492, 810, kYue2AcousticOverlapTokens);
+        record("yue2_acoustic_chunk_for", "cot=off, a 256-frame overlap",
+               std::to_string(chunk), "3675");
+        // Zero means the prefix alone does not fit, which is not the same as
+        // "no limit" -- and the caller that read it that way put a 7105-frame
+        // take back into one piece and paged most of it to system RAM.
+        record("yue2_acoustic_chunk_for", "zero is a refusal, not an absence of limit",
+               std::to_string(yue2_acoustic_chunk_for(budget_3492 - kYue2SemanticRetentionTokens,
+                                                      3893, kYue2AcousticOverlapTokens)),
+               "0");
+        // The two takes that spilled both fit in one such chunk plus a second,
+        // and neither needs shortening any more.
+        record("yue2_acoustic_chunk_for", "the 5152-token take now needs two chunks, not a shorter song",
+               std::to_string((5152 + chunk - 1) / chunk), "2");
+        record("yue2_acoustic_chunk_for", "a chunk costs what the whole take used to",
+               within(acoustic_mib(810 + kYue2AcousticOverlapTokens, chunk), 3236), "1");
+        // A score is prefix at this stage too, so it shortens the chunk rather
+        // than the song -- the same trade, at a tenth the cost.
+        record("yue2_acoustic_chunk_for", "a 3948-token score shortens the chunk instead",
+               std::to_string(yue2_acoustic_chunk_for(budget_3492, 810 + 3948,
+                                                      kYue2AcousticOverlapTokens) > 0),
+               "1");
+        record("yue2_acoustic_chunk_for", "and a prefix that cannot fit at all admits no chunk",
+               std::to_string(yue2_acoustic_chunk_for(12000, 60000, 256)), "0");
+        record("yue2_acoustic_chunk_for", "unmeasurable budget",
+               std::to_string(yue2_acoustic_chunk_for(0, 810, 256)), "0");
+    }
+
+    // With the acoustic stage chunked, only the semantic cache still grows with
+    // the take, and that is what the length is budgeted against now.
+    {
+        const Yue2StageCost semantic_only[] = {
+            Yue2StageCost{kYue2SemanticTokenCost + kYue2SemanticGuidanceCost,
+                          kYue2SemanticTokenCost + kYue2SemanticGuidanceCost, 0},
+        };
+        const int64_t cap = yue2_generated_tokens_for(budget_3492, 810, semantic_only, 1);
+        record("yue2_generated_tokens_for", "guidance on, the semantic stage alone",
+               std::to_string(cap), "9052");
+        // 25 tokens is one second, so this is the three minutes the card could
+        // not hold while the take had to fit the acoustic stage whole.
+        record("yue2_generated_tokens_for", "which is over five minutes of audio",
+               std::to_string(cap / 25 >= 300), "1");
+    }
 
     // Zero is returned for two unrelated reasons, and `yue2_stage_window` reads
     // a zero cap as "no cap". A caller that cannot tell them apart leaves the
@@ -167,16 +326,24 @@ int main() {
     record("yue2_stage_window", "and is not reported as clamped either",
            std::to_string(yue2_stage_window("semantic_max_tokens", 9000, 0).clamped), "0");
 
-    record("yue2_generated_tokens_for", "no prefix",
-           std::to_string(yue2_generated_tokens_for(12000, 0, 5, 6)), "2000");
-    record("yue2_generated_tokens_for", "prefix alone exhausts the budget",
-           std::to_string(yue2_generated_tokens_for(2000, 2600, 5, 6)), "0");
-    record("yue2_generated_tokens_for", "unmeasurable budget",
-           std::to_string(yue2_generated_tokens_for(0, 100, 5, 6)), "0");
-    record("yue2_generated_tokens_for", "zero generated weight",
-           std::to_string(yue2_generated_tokens_for(10000, 0, 5, 0)), "0");
+    {
+        const Yue2StageCost one[] = {Yue2StageCost{5000, 6000, 0}};
+        record("yue2_generated_tokens_for", "no prefix",
+               std::to_string(yue2_generated_tokens_for(12000, 0, one, 1)), "2000");
+        record("yue2_generated_tokens_for", "prefix alone exhausts the budget",
+               std::to_string(yue2_generated_tokens_for(2000, 2600, one, 1)), "0");
+        record("yue2_generated_tokens_for", "unmeasurable budget",
+               std::to_string(yue2_generated_tokens_for(0, 100, one, 1)), "0");
+        const Yue2StageCost free_stage[] = {Yue2StageCost{5000, 0, 0}};
+        record("yue2_generated_tokens_for", "zero generated cost",
+               std::to_string(yue2_generated_tokens_for(10000, 0, free_stage, 1)), "0");
+        record("yue2_generated_tokens_for", "no stages at all",
+               std::to_string(yue2_generated_tokens_for(10000, 0, nullptr, 0)), "0");
+    }
 
-    record("yue2_stage_window", "9000 requested, 4772 fits",
+    {
+        const auto window = yue2_stage_window("semantic_max_tokens", 9000, 4772);
+        record("yue2_stage_window", "9000 requested, 4772 fits",
                std::to_string(window.tokens) + " clamped=" + (window.clamped ? "1" : "0"),
                "4772 clamped=1");
         record("yue2_stage_window", "note text", window.note,

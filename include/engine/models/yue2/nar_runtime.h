@@ -35,6 +35,12 @@ public:
         uint64_t seed,
         int64_t ode_steps,
         int64_t context,
+        // The largest span solved in one piece, and how much of the span before
+        // it is re-solved as context and then discarded. Zero for either leaves
+        // the model's own context window as the only limit -- which is what the
+        // take length used to have to be budgeted against instead.
+        int64_t max_chunk_frames,
+        int64_t overlap_frames,
         runtime::RunControl * control = nullptr);
 
     void release_runtime_graphs();

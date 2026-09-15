@@ -79,12 +79,16 @@ Yue2VaeConfig parse_vae_config(const std::filesystem::path & path) {
 Yue2GenerationConfig parse_generation_config(const std::filesystem::path & path) {
     Yue2GenerationConfig out;
     if (!engine::io::is_existing_file(path)) {
-        out.abc = Yue2SamplingConfig{0.7F, 0.9F, 30, 1.005F, 100, 32, 4096};
+        // 640 rather than 4096: a score is prefix at the acoustic stage too,
+        // re-prefilled once per chunk, so a long one shortens the chunk instead
+        // of the song. 640 is what a 6 GB card sustains without spilling; the
+        // budget lowers it further whenever it measures less free memory.
+        out.abc = Yue2SamplingConfig{0.7F, 0.9F, 30, 1.005F, 100, 32, 640};
         return out;
     }
     const auto root = json::parse_file(path);
     if (const auto * abc = root.find("abc")) {
-        out.abc = parse_sampling(*abc, Yue2SamplingConfig{0.7F, 0.9F, 30, 1.005F, 100, 32, 4096});
+        out.abc = parse_sampling(*abc, Yue2SamplingConfig{0.7F, 0.9F, 30, 1.005F, 100, 32, 640});
     }
     if (const auto * semantic = root.find("semantic")) {
         out.semantic = parse_sampling(*semantic, out.semantic);

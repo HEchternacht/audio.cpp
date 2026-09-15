@@ -51,7 +51,10 @@ struct Yue2SamplingConfig {
     float repetition_penalty = 1.2F;
     int64_t penalty_window = 50;
     int64_t min_tokens = 200;
-    int64_t max_tokens = 9000;
+    // 25 tokens is one second of audio. 8800 is what a 6 GB card sustains
+    // without spilling to system RAM -- measured, not chosen -- and the budget
+    // lowers it whenever it measures less free memory than that.
+    int64_t max_tokens = 8800;
 };
 
 struct Yue2GenerationConfig {
@@ -59,10 +62,14 @@ struct Yue2GenerationConfig {
     Yue2SamplingConfig semantic;
     int64_t ode_steps = 32;
     int64_t context = kContextTokens;
-    // Device memory held back from the per-stage KV budget, for the graph
-    // arenas and the allocator's own slack. Raising it shortens every window,
-    // which is the lever a caller has when a run still runs out of memory.
-    int64_t vram_headroom_mb = 640;
+    // Device memory held back from the per-stage KV budget, for whatever the
+    // per-stage costs do not name and the allocator's own rounding. It used to
+    // be 640 because the largest unnamed cost -- the near-gigabyte the acoustic
+    // stage spends building its runtimes -- was not modelled at all, and even
+    // 640 did not cover it. Now that it is charged explicitly, holding back
+    // another 640 would charge it twice and cost half a minute of song.
+    // Raising this is still the lever a caller has when a run spills anyway.
+    int64_t vram_headroom_mb = 256;
     // Shrinks every window the budget allows, multiplicatively. 1.0 trusts the
     // estimate; a run that ran out of memory anyway is retried at 0.5, then
     // 0.25, which no amount of unaccounted overhead can defeat.

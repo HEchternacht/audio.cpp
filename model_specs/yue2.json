@@ -159,9 +159,10 @@
       {
         "name": "abc_max_tokens",
         "type": "int",
-        "description": "Maximum ABC planner tokens.",
+        "description": "Maximum ABC planner tokens. The default is what a 6 GB card sustains without spilling to system RAM: a score token is prefilled again for every acoustic chunk, so a longer score shortens the chunk rather than the song. The server lowers this further when it measures less free memory.",
         "required": false,
-        "min": 1
+        "min": 1,
+        "default": 640
       },
       {
         "name": "semantic_temperature",
@@ -210,9 +211,10 @@
       {
         "name": "semantic_max_tokens",
         "type": "int",
-        "description": "Maximum semantic codec tokens.",
+        "description": "Maximum semantic codec tokens, at 25 per second of audio. The default is what a 6 GB card sustains without spilling to system RAM. The server lowers it when it measures less free memory, and says so in the job log.",
         "required": false,
-        "min": 1
+        "min": 1,
+        "default": 8800
       }
     ],
     "session": [
