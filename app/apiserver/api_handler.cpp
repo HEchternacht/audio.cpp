@@ -1,6 +1,7 @@
 #include "api_handler.h"
 
 #include "api_error.h"
+#include "input_paths.h"
 #include "job_view.h"
 #include "result_json.h"
 #include "wav.h"
@@ -223,6 +224,7 @@ void ApiHandler::run_job(Job & job, const std::shared_ptr<engine::runtime::RunCo
     // Client strings never reach resolve_case_path: the base directory is the
     // job's own input folder, which nothing outside the server can write to.
     const auto staging = store_.job_dir(job.id) / "input";
+    stage_uploads(job, staging);
     auto task_request = minitts::cli::build_request_from_json(effective, staging);
 
     for (const auto & entry : task_request.options) {
@@ -524,6 +526,71 @@ HttpResponse ApiHandler::handle_model_unload(const HttpRequest & request, const 
     return json_ok(Value::make_object(std::move(root)));
 }
 
+/**
+ * Takes one file and keeps it until a job asks for it.
+ *
+ * The body is the file. Not multipart: there is one file, the client already
+ * knows its type, and a parser for a format whose only job is to carry one
+ * blob is a parser that can be wrong. The name comes from `?name=`, is scrubbed
+ * down to something that cannot steer a path, and is what the job refers to the
+ * file by afterwards.
+ */
+HttpResponse ApiHandler::handle_upload(const HttpRequest & request, const PathParams &) {
+    if (request.body.empty()) {
+        throw bad_request("an upload needs a body: send the file bytes, with ?name=<filename>");
+    }
+    const auto max_bytes = static_cast<size_t>(config_.max_upload_mb) * 1024U * 1024U;
+    if (request.body.size() > max_bytes) {
+        throw bad_request("this upload is larger than the " + std::to_string(config_.max_upload_mb) +
+                          " MiB limit");
+    }
+
+    const auto query = parse_query(request.query);
+    const auto named = query.find("name");
+    const auto name = safe_upload_name(named != query.end() ? named->second : "upload.bin");
+    const auto id = "up_" + make_job_id(now_ms()).substr(4);
+    const auto directory = store_.root() / "uploads" / id;
+
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    if (ec) throw internal("could not make room for the upload: " + ec.message());
+    std::ofstream out(directory / name, std::ios::binary);
+    out.write(request.body.data(), static_cast<std::streamsize>(request.body.size()));
+    out.close();
+    if (!out) throw internal("the upload could not be written");
+
+    Value::Object root;
+    root["id"] = Value::make_string(id);
+    root["name"] = Value::make_string(name);
+    root["bytes"] = Value::make_number(static_cast<double>(request.body.size()));
+    return json_ok(Value::make_object(std::move(root)), 201);
+}
+
+void ApiHandler::stage_uploads(const Job & job, const std::filesystem::path & staging) {
+    const auto * uploads = job.request.find("uploads");
+    if (uploads == nullptr || !uploads->is_array()) return;
+
+    std::error_code ec;
+    std::filesystem::create_directories(staging, ec);
+    for (const auto & entry : uploads->as_array()) {
+        if (!entry.is_string()) continue;
+        const auto & id = entry.as_string();
+        if (!is_confined_name(id) || id.rfind("up_", 0) != 0) {
+            throw bad_request("not an upload id: " + id);
+        }
+        const auto directory = store_.root() / "uploads" / id;
+        if (!std::filesystem::is_directory(directory)) {
+            throw not_found("no upload " + id + ": it may have been cleaned up since");
+        }
+        for (const auto & file : std::filesystem::directory_iterator(directory)) {
+            if (!file.is_regular_file()) continue;
+            std::filesystem::copy_file(file.path(), staging / file.path().filename(),
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) throw internal("could not stage " + id + ": " + ec.message());
+        }
+    }
+}
+
 HttpResponse ApiHandler::handle_submit_task(const HttpRequest & request, const PathParams &) {
     const auto body = parse_body(request.body);
     const auto model_id = engine::io::json::optional_string(body, "model", "");
@@ -533,6 +600,12 @@ HttpResponse ApiHandler::handle_submit_task(const HttpRequest & request, const P
     if (!pool_.has(model_id)) {
         throw not_found("unknown model id: " + model_id);
     }
+
+    // Before anything is written down: a filename a client sent has to name a
+    // file in this job's own inputs. See input_paths.h -- over HTTP the CLI's
+    // path rules are an arbitrary file read.
+    const auto * submitted = body.find("request");
+    confine_request_paths(submitted != nullptr ? *submitted : body);
 
     Job job;
     job.id = make_job_id(now_ms());
@@ -830,6 +903,7 @@ void ApiHandler::register_routes() {
     router_.add("POST", "/v1/models/load", bind(&ApiHandler::handle_model_load));
     router_.add("POST", "/v1/models/unload", bind(&ApiHandler::handle_model_unload));
     router_.add("GET", "/v1/queue", bind(&ApiHandler::handle_queue));
+    router_.add("POST", "/v1/uploads", bind(&ApiHandler::handle_upload));
 
     // Literal routes go in before the capture route that would also match them.
     router_.add("POST", "/v1/tasks", bind(&ApiHandler::handle_submit_task));

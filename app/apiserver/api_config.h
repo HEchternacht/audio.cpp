@@ -27,6 +27,10 @@ struct ApiConfig {
     int workers = 1;
     std::filesystem::path data_dir;
     size_t max_queued = 256;
+    // The largest file a client may upload as a job input, in MiB. A recording
+    // to transcribe is a few tens of megabytes; anything far past that is a
+    // mistake or an attempt to fill the disk.
+    int max_upload_mb = 128;
     int progress_interval_ms = 250;
     int gc_interval_minutes = 60;
     int shutdown_grace_ms = 10000;

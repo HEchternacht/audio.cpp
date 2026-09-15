@@ -32,6 +32,8 @@ ApiConfig apply_api_overrides(ApiConfig defaults, const Value & document) {
     config.workers = static_cast<int>(optional_i64_at(*api, "workers", config.workers));
     config.max_queued = static_cast<size_t>(
         optional_i64_at(*api, "max_queued", static_cast<int64_t>(config.max_queued)));
+    config.max_upload_mb = static_cast<int>(
+        optional_i64_at(*api, "max_upload_mb", config.max_upload_mb));
     config.progress_interval_ms =
         static_cast<int>(optional_i64_at(*api, "progress_interval_ms", config.progress_interval_ms));
     config.gc_interval_minutes =

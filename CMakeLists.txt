@@ -520,7 +520,6 @@ add_library(engine_core OBJECT
     src/framework/codecs/neural_audio.cpp
     src/framework/codecs/oobleck_audio_vae_runtime.cpp
     src/framework/codecs/redae_codec_runtime.cpp
-    src/framework/midi/sheetsage2_runtime.cpp
     src/framework/conditioners/clap_audio_conditioner_runtime.cpp
     src/framework/conditioners/cav_mae_st_conditioner_runtime.cpp
     src/framework/conditioners/musicgen_style_conditioner_runtime.cpp
@@ -1365,6 +1364,22 @@ audiocpp_add_model(yue2
         engine::models::yue2::make_yue2_loader
 )
 
+audiocpp_add_model(sheetsage2
+    SOURCES
+        src/models/sheetsage/audio_frontend.cpp
+        src/models/sheetsage/processing.cpp
+        src/models/sheetsage/runtime.cpp
+        src/models/sheetsage/session.cpp
+    INCLUDES
+        engine/models/sheetsage/audio_frontend.h
+        engine/models/sheetsage/processing.h
+        engine/models/sheetsage/types.h
+        engine/models/sheetsage/runtime.h
+        engine/models/sheetsage/session.h
+    LOADERS
+        engine::models::sheetsage::make_sheetsage2_loader
+)
+
 audiocpp_add_model(supertonic
     SOURCES
         src/models/supertonic/assets.cpp
@@ -2064,6 +2079,7 @@ add_executable(audiocpp_apiserver
     app/apiserver/api_error.cpp
     app/apiserver/api_handler.cpp
     app/apiserver/event_bus.cpp
+    app/apiserver/input_paths.cpp
     app/apiserver/job.cpp
     app/apiserver/job_queue.cpp
     app/apiserver/job_store.cpp
@@ -2129,6 +2145,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
     endif()
 
     add_executable(sheetsage2_decoder_parity_probe
+        src/models/sheetsage/runtime.cpp
         tests/yue2/sheetsage2_decoder_parity_probe.cpp
     )
     target_link_libraries(sheetsage2_decoder_parity_probe PRIVATE engine_runtime ggml)
@@ -2245,6 +2262,8 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         app/apiserver/worker_pool.cpp app/apiserver/job_queue.cpp
         app/apiserver/job_store.cpp app/apiserver/job.cpp)
     audiocpp_api_selftest(event_bus AUDIOCPP_SELFTEST_EVENT_BUS app/apiserver/event_bus.cpp)
+    audiocpp_api_selftest(input_paths AUDIOCPP_SELFTEST_INPUT_PATHS
+        app/apiserver/input_paths.cpp app/apiserver/api_error.cpp app/server/http.cpp)
     audiocpp_api_selftest(api_error AUDIOCPP_SELFTEST_API_ERROR
         app/apiserver/api_error.cpp app/server/http.cpp)
     audiocpp_api_selftest(router AUDIOCPP_SELFTEST_ROUTER
@@ -2289,6 +2308,13 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         add_engine_unittest(audio_dsp_test tests/unittests/test_audio_dsp.cpp)
         add_test(NAME audio_dsp_test COMMAND audio_dsp_test)
+
+        if(sheetsage2 IN_LIST AUDIOCPP_LINKED_MODELS)
+            add_engine_unittest(sheetsage_audio_frontend_test tests/unittests/test_sheetsage_audio_frontend.cpp)
+            add_test(NAME sheetsage_audio_frontend_test COMMAND sheetsage_audio_frontend_test --log)
+            add_engine_unittest(sheetsage_processing_test tests/unittests/test_sheetsage_processing.cpp)
+            add_test(NAME sheetsage_processing_test COMMAND sheetsage_processing_test --log)
+        endif()
 
         add_engine_unittest(midi_file_test tests/unittests/test_midi_file.cpp)
         add_test(NAME midi_file_test COMMAND midi_file_test)

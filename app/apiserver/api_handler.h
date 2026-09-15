@@ -17,6 +17,7 @@
 #include "worker_pool.h"
 
 #include <atomic>
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -59,6 +60,12 @@ private:
     minitts::server::HttpResponse handle_job_patch(const minitts::server::HttpRequest &, const PathParams &);
     minitts::server::HttpResponse handle_job_events(const minitts::server::HttpRequest &, const PathParams &);
     minitts::server::HttpResponse handle_queue(const minitts::server::HttpRequest &, const PathParams &);
+    minitts::server::HttpResponse handle_upload(const minitts::server::HttpRequest &, const PathParams &);
+
+    // Copies whatever the request named in "uploads" into the job's own input
+    // directory, under the name the upload was stored as. Everything a family
+    // opens is then a plain name inside one directory the server owns.
+    void stage_uploads(const Job & job, const std::filesystem::path & staging);
     minitts::server::HttpResponse handle_openapi(const minitts::server::HttpRequest &, const PathParams &);
 
     Job require_job(const std::string & id) const;
