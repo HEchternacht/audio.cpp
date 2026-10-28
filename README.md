@@ -1,23 +1,28 @@
-> # HEchternacht/audio.cpp, branch `api-server`: fork notes
-> Personal fork of [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp) used as the engine behind **Yui** (local AI music generation). Branch **`api-server`** = upstream `dev` + the work below. Upstream README follows unchanged.
->
-> ## Changes from upstream
-> - **`audiocpp_apiserver`** (`app/apiserver/`, full docs in [`app/apiserver/README.md`](app/apiserver/README.md)): a durable, cancellable **job API** over HTTP (default `127.0.0.1:8781`): upload audio, queue a generation, stream progress over SSE, fetch outputs, cancel, pin/delete. Jobs and their files live in a store that survives restarts (interrupted jobs are marked on next start). Paths never travel in requests; `/health`, `/openapi.yaml`. Alongside the existing `audiocpp_server`.
-> - **YuE2 (lyrics-to-song) that fits small GPUs**:
->   - every stage is fitted to the free VRAM instead of failing: an out-of-memory makes a *shorter* take rather than a failed one, and a take is never split to save memory;
->   - memory is **measured** per run rather than estimated, the semantic prefix is charged at the prefix rate, and score caches are no longer charged per token;
->   - `nar_context` exposed so a long take fits a small card; model dropped after a failed run, with optional unload after every job.
-> - **Audio -> score**: transcribe a recording into a score with the existing SheetSage engine (`src/models/sheetsage/session.cpp`), exposed as an API job type.
-> - Studio/UI companion: [audiocpp-studio](https://github.com/HEchternacht/audiocpp-studio); launchers: [yui-launchers](https://github.com/HEchternacht/yui-launchers).
->
-> ## Build and run (Windows, CUDA)
-> ```powershell
-> powershell -File scripts\build_windows.ps1 -Preset windows-cuda-release -Target audiocpp_apiserver
-> build\windows-cuda-release\bin\audiocpp_apiserver.exe --config api.json
-> ```
-> `api.json` (ports, model paths, data dir, workers) is documented in `app/apiserver/README.md`.
+# Changes from the original
+
+**This is a fork of [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp).** Everything below the line is the original README, unchanged. What this fork changes or adds:
+
+Personal fork of [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp) used as the engine behind **Yui** (local AI music generation). Branch **`api-server`** = upstream `dev` + the work below.
+
+
+- **`audiocpp_apiserver`** (`app/apiserver/`, full docs in [`app/apiserver/README.md`](app/apiserver/README.md)): a durable, cancellable **job API** over HTTP (default `127.0.0.1:8781`): upload audio, queue a generation, stream progress over SSE, fetch outputs, cancel, pin/delete. Jobs and their files live in a store that survives restarts (interrupted jobs are marked on next start). Paths never travel in requests; `/health`, `/openapi.yaml`. Alongside the existing `audiocpp_server`.
+- **YuE2 (lyrics-to-song) that fits small GPUs**:
+  - every stage is fitted to the free VRAM instead of failing: an out-of-memory makes a *shorter* take rather than a failed one, and a take is never split to save memory;
+  - memory is **measured** per run rather than estimated, the semantic prefix is charged at the prefix rate, and score caches are no longer charged per token;
+  - `nar_context` exposed so a long take fits a small card; model dropped after a failed run, with optional unload after every job.
+- **Audio -> score**: transcribe a recording into a score with the existing SheetSage engine (`src/models/sheetsage/session.cpp`), exposed as an API job type.
+- Studio/UI companion: [audiocpp-studio](https://github.com/HEchternacht/audiocpp-studio); launchers: [yui-launchers](https://github.com/HEchternacht/yui-launchers).
+
+## Build and run (Windows, CUDA)
+```powershell
+powershell -File scripts\build_windows.ps1 -Preset windows-cuda-release -Target audiocpp_apiserver
+build\windows-cuda-release\bin\audiocpp_apiserver.exe --config api.json
+```
+`api.json` (ports, model paths, data dir, workers) is documented in `app/apiserver/README.md`.
 
 ---
+
+# Original README
 
 # audio.cpp
 
