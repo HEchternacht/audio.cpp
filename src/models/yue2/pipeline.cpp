@@ -48,7 +48,11 @@ std::vector<int32_t> token_prefixes(
         return out;
     }
     out.insert(out.end(), abc_ids.begin(), abc_ids.end());
-    if (!request.abc.empty()) {
+    // Closing the block is what makes a score binding: after kAbcEndToken there
+    // is nothing left for the planner to add. Seed mode leaves it open, so the
+    // supplied bars read as the beginning of a score the model is still writing
+    // rather than the whole of one. The planner closes it once it has finished.
+    if (!request.abc.empty() && request.abc_mode == Yue2AbcMode::Strict) {
         out.push_back(kAbcEndToken);
         out.push_back(kMusicStartToken);
     }
@@ -174,7 +178,7 @@ public:
     // Headroom for everything that is not the KV cache: the graph arenas, the
     // logits readback, the allocator's own rounding. Measured peaks on a 6 GB
     // card sit about this far above the cache alone.
-    int64_t vram_headroom_bytes = 640LL << 20;
+    int64_t vram_headroom_bytes = 100LL << 20;
     double vram_budget_scale = 1.0;
 
     int64_t cache_bytes_per_token() const {
@@ -183,6 +187,22 @@ public:
             assets->config.model.kv_heads,
             assets->config.model.head_dim,
             yue2_ar_cache_bytes_per_element(execution->backend_type())});
+    }
+
+    // Free memory at a named moment of the run. The score cap is sized against
+    // a prediction of what the semantic stage will still be holding when the
+    // acoustic stage starts, and until now nothing printed the quantity being
+    // predicted -- so the constant could only ever be checked by inference.
+    void report_free(const char * moment) const {
+        const int64_t free_bytes = free_device_bytes();
+        if (free_bytes <= 0) {
+            return;
+        }
+        const int64_t per_token = std::max<int64_t>(1, cache_bytes_per_token());
+        std::fprintf(stderr, "[yue2] free at %s: %lld MiB (%lld cache-tokens)\n", moment,
+                     static_cast<long long>(free_bytes >> 20),
+                     static_cast<long long>(free_bytes / per_token));
+        engine::debug::timing_log_scalar(std::string("yue2.free.") + moment, free_bytes);
     }
 
     int64_t stage_token_cap(int64_t sequences, int64_t cost_weight) const {
@@ -361,8 +381,13 @@ public:
             engine::debug::timing_log_scalar("yue2.semantic.total_inner_ms", engine::debug::elapsed_ms(total_start));
             return out;
         }
-        if (request.cot != Yue2CotMode::Off && request.abc.empty()) {
+        // Seed mode runs the planner too: the supplied score is its opening, not
+        // its replacement.
+        if (request.cot != Yue2CotMode::Off &&
+            (request.abc.empty() || request.abc_mode == Yue2AbcMode::Seed)) {
+            report_free("plan");
             ensure_ar();
+            report_free("plan_ar_loaded");
             const auto abc_start = Clock::now();
             auto abc = abc_window(request.generation);
             fit_stage("abc_max_tokens", abc.max_tokens, 1, kYue2DecodeCostWeight);
@@ -380,20 +405,48 @@ public:
                                                 static_cast<int64_t>(out.plan.prefix.size())),
                           "the longest score that still leaves a 20-second acoustic chunk");
             }
-            out.plan.abc_ids = ar->generate(out.plan.prefix, abc, request.seed, control);
+            // What the model adds, which in seed mode is the continuation rather
+            // than the whole. The prefix already carries the seed -- appending
+            // the seed again here is what would turn "carry on from these bars"
+            // into "play these bars twice".
+            const auto written = ar->generate(out.plan.prefix, abc, request.seed, control);
             engine::debug::timing_log_scalar("yue2.semantic.abc_generate_ms", engine::debug::elapsed_ms(abc_start));
+            engine::debug::timing_log_scalar("yue2.semantic.abc_seed_tokens", out.plan.abc_ids.size());
+            out.plan.abc_ids.insert(out.plan.abc_ids.end(), written.begin(), written.end());
             // Detokenise the plan the model just wrote. Until now these ids were
             // consumed as a prefix and discarded, so the score the model composed
             // was never visible -- which is what made the documented
-            // edit-the-score-and-re-render workflow impossible to reach.
+            // edit-the-score-and-re-render workflow impossible to reach. In seed
+            // mode this is seed and continuation together: the score that was
+            // actually sung, which is the one worth handing back.
             out.plan.abc = tokenizer.decode(out.plan.abc_ids);
-            out.plan.truncated = static_cast<int64_t>(out.plan.abc_ids.size()) >= request.generation.abc.max_tokens;
-            out.plan.prefix.insert(out.plan.prefix.end(), out.plan.abc_ids.begin(), out.plan.abc_ids.end());
+            // Against the window actually used, not the one requested. The
+            // budget caps `abc.max_tokens` well below `request.generation`'s
+            // copy, so comparing with the request said "not truncated" about
+            // every score this card has ever cut -- which is why a score
+            // stopping mid-bar went unreported for as long as it did.
+            out.plan.truncated = static_cast<int64_t>(written.size()) >= abc.max_tokens;
+            out.plan.prefix.insert(out.plan.prefix.end(), written.begin(), written.end());
             out.plan.prefix.push_back(kAbcEndToken);
             out.plan.prefix.push_back(kMusicStartToken);
-            engine::debug::timing_log_scalar("yue2.semantic.abc_generated_tokens", out.plan.abc_ids.size());
+            engine::debug::timing_log_scalar("yue2.semantic.abc_generated_tokens", written.size());
             engine::debug::timing_log_scalar("yue2.semantic.abc_truncated", out.plan.truncated);
+            if (out.plan.truncated) {
+                // A cut score is a fact about the take, not a diagnostic: the
+                // song stops where the score does, and the ABC handed back for
+                // editing ends mid-bar. It travels with the other budget notes
+                // so the run says it out loud.
+                const std::string line =
+                    "abc_max_tokens: the score was cut at " + std::to_string(abc.max_tokens) +
+                    " tokens, so it ends mid-phrase and the take is shorter than the lyrics ask for";
+                std::fprintf(stderr, "[yue2] %s\n", line.c_str());
+                if (active_control != nullptr) {
+                    active_control->log(line);
+                }
+                budget_notes.push_back(line);
+            }
             ar->release_runtime_graphs();
+            report_free("abc_released");
         }
         ensure_ar();
         const auto negative_start = Clock::now();
@@ -469,11 +522,32 @@ public:
             watch.charge(prefix_tokens + static_cast<int64_t>(out.tokens.size()));
         }
         engine::debug::timing_log_scalar("yue2.semantic.music_generate_ms", engine::debug::elapsed_ms(music_start));
-        out.truncated = static_cast<int64_t>(out.tokens.size()) >= request.generation.semantic.max_tokens;
+        // Against the window used, not the one asked for -- the same correction
+        // the score needed, and for the same reason: the budget lowers this one
+        // too, so comparing with the request called every capped take
+        // "finished".
+        out.truncated = static_cast<int64_t>(out.tokens.size()) >= semantic.max_tokens;
+        if (out.truncated) {
+            // The song did not end, it ran out. Worth saying plainly: the take
+            // stops mid-phrase and the only fix is a larger window -- less
+            // headroom, or a shorter score sharing the budget.
+            const std::string line =
+                "semantic_max_tokens: the take reached its ceiling of " +
+                std::to_string(semantic.max_tokens) + " tokens (" +
+                std::to_string(semantic.max_tokens / 25) +
+                " seconds) and stops there rather than ending; lower vram_headroom_mb or shorten "
+                "the score to buy a longer one";
+            std::fprintf(stderr, "[yue2] %s\n", line.c_str());
+            if (active_control != nullptr) {
+                active_control->log(line);
+            }
+            budget_notes.push_back(line);
+        }
         engine::debug::timing_log_scalar("yue2.semantic.tokens", out.tokens.size());
         engine::debug::timing_log_scalar("yue2.semantic.truncated", out.truncated);
         engine::debug::timing_log_scalar("yue2.semantic.total_inner_ms", engine::debug::elapsed_ms(total_start));
         ar->release_runtime_graphs();
+        report_free("semantic_released");
         return out;
     }
 
@@ -496,8 +570,17 @@ public:
         // hides a fixed cost the budget then fails to reserve. On this card
         // that omission was most of the margin the run was supposed to keep.
         StageWatch watch(*this, "acoustic");
+        // Measured before the runtimes are built, for the same reason the watch
+        // opens here: `kYue2AcousticFixedTokens` exists precisely to reserve the
+        // NAR load and the AR rebuild, so a budget read after them has already
+        // paid that cost once and the fixed term then charges it again. On this
+        // card the double charge was 964 MiB -- 8800 cache-tokens of chunk,
+        // which is most of a chunk and, through the score cap that is sized off
+        // the same arithmetic, most of the score.
+        const int64_t chunk_budget = stage_token_cap(1, kYue2DecodeCostWeight);
         ensure_nar();
         ensure_ar();
+        report_free("acoustic_ready");
         // Chunked, and sized here rather than by the model's context window,
         // which on this card is some five times what the memory allows. This
         // used to be left unbudgeted on the grounds that splitting a take is
@@ -506,9 +589,8 @@ public:
         // overlap through the solver and discarding its latents removes that
         // reason, and with it the need to shorten every take until the whole of
         // it fits the card at once.
-        const int64_t context = generation.context;
+        int64_t context = generation.context;
         const int64_t prefix_tokens = static_cast<int64_t>(semantic.plan.prefix.size());
-        const int64_t chunk_budget = stage_token_cap(1, kYue2DecodeCostWeight);
         const int64_t fitted_chunk = yue2_acoustic_chunk_for(chunk_budget, prefix_tokens,
                                                              kYue2AcousticOverlapTokens);
         // A chunk of zero means the prefix alone does not fit, and the runtime
@@ -517,11 +599,33 @@ public:
         // the stage say it is spilling: a take split into pieces that each
         // overflow a little is far cheaper than one piece that overflows
         // entirely.
-        const int64_t max_chunk = fitted_chunk > 0 ? fitted_chunk : kYue2MinAcousticChunkTokens;
+        int64_t max_chunk = fitted_chunk > 0 ? fitted_chunk : kYue2MinAcousticChunkTokens;
         if (fitted_chunk <= 0) {
             warn_if_spilling("acoustic", prefix_tokens + max_chunk, prefix_tokens);
         }
         const int64_t take = static_cast<int64_t>(codec.size());
+        // Asked for outright: one window, whatever the budget worked out. The
+        // model's own window caps a chunk at (context - prefix - 3) / 2 inside
+        // `chunk_ranges`, so widening the budget alone would not do it -- the
+        // context has to be widened to match or the take splits anyway, which is
+        // the failure mode where a checkbox silently does nothing.
+        if (generation.acoustic_single_window && take > 0) {
+            context = std::max(context, 2 * take + prefix_tokens + 3);
+            if (take > max_chunk) {
+                const std::string line =
+                    "acoustic_single_window: solving all " + std::to_string(take) +
+                    " frames in one window, though only " + std::to_string(max_chunk) +
+                    " fit device memory -- the seam is gone and the driver serves the "
+                    "difference from system RAM, so expect this stage to take several times "
+                    "longer; clear the option to let it chunk again";
+                std::fprintf(stderr, "[yue2] %s\n", line.c_str());
+                if (active_control != nullptr) {
+                    active_control->log(line);
+                }
+                budget_notes.push_back(line);
+            }
+            max_chunk = take;
+        }
         if (take > max_chunk) {
             const int64_t chunks = (take + max_chunk - 1) / max_chunk;
             const std::string line =

@@ -122,10 +122,25 @@ constexpr int64_t kYue2AcousticFixedTokens = 9837;
 // whether it fits the card at all -- but a chunk solved against nothing but the
 // style prefix has no idea what the music was doing a moment ago, and the seam
 // arrives as a lurch. Carrying the previous frames through the solver and then
-// discarding their latents is what makes the join continuous. Ten seconds of
-// audio, costing one prefill's worth of prefix and about an eighth of the
-// solver's work.
-constexpr int64_t kYue2AcousticOverlapTokens = 256;
+// discarding their latents is what makes the join continuous.
+//
+// Thirty seconds, up from ten, because ten is about a phrase and a seam can
+// still land on a change the chunk before it never saw. The cost is exact: an
+// overlap token is charged at the prefix rate and buys back at the generated
+// rate, so 3700/4300 of a chunk token each. Against the 3675-token chunk this
+// card fits, the ladder reads:
+//
+//   overlap   context   chunk   work discarded   chunks for a 4:00 take
+//      256     10.2s     3675          7.0%              1.6
+//      768     30.7s     3234         23.7%              1.9
+//     1536     61.4s     2574         59.7%              2.3
+//
+// which is why it stops here rather than going further: past about a thousand
+// the shrinking chunk adds seams faster than the longer overlap smooths them,
+// and the setting starts working against its own purpose. `chunk_ranges` clamps
+// the overlap to the chunk it is carried into, so a chunk driven down to the
+// floor narrows its overlap rather than solving mostly discarded work.
+constexpr int64_t kYue2AcousticOverlapTokens = 768;
 
 // The longest chunk the acoustic stage can solve in one piece: what is left of
 // the budget once its fixed cost and the prefix it re-prefills -- style, lyrics
@@ -146,17 +161,27 @@ int64_t yue2_acoustic_chunk_for(int64_t cache_tokens, int64_t prefix_tokens,
 constexpr int64_t kYue2MinAcousticChunkTokens = 512;
 
 // What the semantic stage is still holding when the acoustic stage starts, over
-// and above what the acoustic stage then allocates for itself. Releasing the
-// decode caches does not give all of it back: the runtimes, their graphs and
-// the backend's own cached allocations stay, and measured across four takes
-// that came to between 968 and 1222 MiB. The conservative end, in cache-tokens.
+// and above what the acoustic stage then allocates for itself.
+//
+// The 968-1222 MiB this used to carry was not retention at all. It was measured
+// as free-at-plan minus free-at-acoustic-start, and that span contains the NAR
+// weight load -- which `kYue2AcousticFixedTokens` already reserves. The same
+// gigabyte was therefore subtracted twice, once here and once there, and the
+// score cap sized off the difference is what held a 6 GB card to a 640-token
+// score that stopped mid-bar.
+//
+// Probed per moment instead of across the span, the semantic stage gives back
+// all but 234 MiB: free went 3492 -> 3268 MiB over the planner and 3268 -> 3258
+// over the whole semantic decode. `release_runtime_graphs` frees the decode
+// buffers and the KV caches with them, so there was never a cache left resident
+// to budget around. 2560 is that 234 MiB rounded up, and the check that it is
+// right is that the score cap and the live acoustic budget now agree to within
+// five per cent instead of differing by a NAR.
 //
 // It matters at exactly one point. The planner writes its score before the
 // semantic stage runs, so the only free memory anyone can measure then is the
-// larger figure -- and sizing a score against that is what let a 3083-token
-// score through, which the acoustic stage could not then prefill at all. The
-// next lever on length is to stop retaining this, not to budget around it.
-constexpr int64_t kYue2SemanticRetentionTokens = 11200;
+// larger figure.
+constexpr int64_t kYue2SemanticRetentionTokens = 2560;
 
 // The longest planner score that still leaves a workable chunk behind it. Takes
 // the budget as measured at the planner stage and discounts what the semantic

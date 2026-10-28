@@ -145,8 +145,9 @@ Three request options override the estimate when you know better:
 | Option | Default | Effect |
 |---|---:|---|
 | `nar_context` | `24576` | Acoustic window in tokens; the chunk solved at once is `(nar_context - prefix - 3) / 2` |
-| `vram_headroom_mb` | `640` | Held back from the estimate for graph arenas and allocator slack. Never more than half of what is free |
+| `vram_headroom_mb` | `100` | Held back from the estimate for graph arenas and allocator slack. Never more than half of what is free. Low by default, so the score and the take run as long as the card allows; raise it when a run's notes report spilling to system RAM |
 | `vram_budget_scale` | `1.0` | Multiplies every window the budget allows. The lever the retry escalates |
+| `acoustic_single_window` | `false` | Solve the take as one acoustic window rather than letting the budget split it. Removes the seam a chunk boundary leaves; a take too large for the card then spills to system RAM and the stage runs several times slower, which the run's notes say. An out-of-memory retry gives this up first, before it touches `vram_budget_scale` |
 
 Measured on an RTX 4050 (6 GB), everything at stock defaults: prompts that had
 failed render 2:02, 3:23 and 2:37 of audio, peaking at 5.2-5.5 GiB. The cost is
@@ -350,11 +351,39 @@ rather than plan a new one:
 
 Same words, same voice, different harmony. It is also considerably faster — 23 s
 against 165 s in one measured pair — because supplying a score skips the
-planning stage entirely.
+planning stage entirely. That last point has a consequence worth
+knowing: on a run that supplies `abc`, every `abc_*` sampling option is inert,
+because the planner they configure never executes.
 
-**5. Or continue it.** A finished job also emits `semantic_codes`, the tokens
-behind its audio. Those replay as a prefix, so a later run extends the take
-rather than starting over.
+**4b. Or use the score as an idea rather than an arrangement.** `abc_mode`
+decides what a supplied score is for:
+
+| `abc_mode` | What happens |
+|---|---|
+| `strict` (default) | The ABC block is closed after your score. The planner never runs and the model sings exactly what you gave it |
+| `seed` | The block is left open. Your score becomes the opening of the planner's own context, and the model carries on writing it -- same key, same meter, same feel, because it is reading its own prefix -- then sings the whole thing |
+
+So `seed` turns eight bars into a full song built on them. The score that comes
+back in `outputs/score.abc` is the whole of what was sung, your bars included,
+so it can be edited and re-rendered like any other.
+
+```json
+{"options": {"style": "bossa nova, nylon guitar", "cot": "full",
+             "abc": "<eight bars>", "abc_mode": "seed"}}
+```
+
+**5. Replay it.** A finished job also emits `semantic_codes`, the tokens behind
+its audio. Supplying them through `semantic_codes_file` **replaces** generation
+with those tokens and re-renders them -- useful for re-decoding a take without
+singing it again, and for teacher forcing while debugging.
+
+It does not extend anything. `generate_semantic` copies the codes and returns
+before the model runs, so nothing is continued. Real continuation means feeding
+the codes to the AR as a prefix after `kMusicStartToken` instead of as a
+replacement, and that is not implemented. To make a take longer today, give the
+singing a larger window -- lower `vram_headroom_mb`, or a shorter score sharing
+the budget -- and read the job notes, which now say when a take stopped because
+it hit its ceiling rather than because it ended.
 
 ## What each family can do
 

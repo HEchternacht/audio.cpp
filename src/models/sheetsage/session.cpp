@@ -6,6 +6,7 @@
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/model_spec/package.h"
 #include "engine/framework/runtime/options.h"
+#include "engine/framework/runtime/run_control.h"
 #include "engine/framework/runtime/spec_backed_model.h"
 
 #include <algorithm>
@@ -810,7 +811,10 @@ std::vector<int32_t> generate_tokens(
     const SheetSage2Tokenizer & tokenizer,
     int64_t max_sequence_length,
     const std::vector<int32_t> * prefix_tokens,
-    std::optional<double> stop_time_seconds) {
+    std::optional<double> stop_time_seconds,
+    const std::shared_ptr<runtime::RunControl> & control,
+    int64_t window_index,
+    int64_t window_count) {
     auto ids = prefix_tokens == nullptr ? prompt_prefix(tokenizer) : *prefix_tokens;
     if (ids.empty() || ids.front() != tokenizer.sos) {
         throw std::runtime_error("SheetSage2 generation prefix must begin with sos");
@@ -832,6 +836,19 @@ std::vector<int32_t> generate_tokens(
     decoder.reset_cached_decode(memory, memory_steps, max_sequence_length);
     std::vector<float> logits = decoder.prefill_cached_decode(ids);
     for (int64_t step = static_cast<int64_t>(ids.size()); step < max_sequence_length; ++step) {
+        // Once per token, which is how a cancel gets answered in tens of
+        // milliseconds rather than at the end of a three-minute transcription.
+        //
+        // Counted in tokens across the whole job rather than in windows: a take
+        // short enough to be a single window would otherwise sit at 0 of 1 for
+        // its entire run, which is the bar saying nothing at all. The total is
+        // the ceiling, so it overestimates -- a window stops at its last event,
+        // not at max_sequence_length -- and the bar therefore advances honestly
+        // and then completes early, which is what the semantic stage does too.
+        runtime::run_checkpoint(
+            control,
+            runtime::ProgressEvent{"transcribe", window_index * max_sequence_length + step,
+                                   window_count * max_sequence_length, ""});
         const int32_t token = select_next_token(logits, tokenizer, state);
         ids.push_back(token);
         bool finished = update_grammar(tokenizer, state, token);
@@ -1004,6 +1021,13 @@ runtime::TaskResult SheetSage2Session::run(const runtime::TaskRequest & request)
         static_cast<double>(assets_->config.input_audio_length_samples) / static_cast<double>(assets_->config.sampling_rate);
 
     for (const auto & window : windows) {
+        // The mel front end and the encoder run before a single token is
+        // sampled, and on a long take that is seconds apiece. Without this, a
+        // cancel arriving during them waits for the decoder to start.
+        runtime::run_checkpoint(
+            request.control,
+            runtime::ProgressEvent{"transcribe", window.index * max_tokens,
+                                   static_cast<int64_t>(windows.size()) * max_tokens, ""});
         const auto window_frontend_start = Clock::now();
         const auto window_audio = slice_window_audio(waveform, window.start_sample, assets_->config.input_audio_length_samples);
         int64_t mel_frames = 0;
@@ -1037,7 +1061,10 @@ runtime::TaskResult SheetSage2Session::run(const runtime::TaskRequest & request)
             tokenizer,
             max_tokens,
             prefix_tokens.empty() ? nullptr : &prefix_tokens,
-            window.generation_stop);
+            window.generation_stop,
+            request.control,
+            window.index,
+            static_cast<int64_t>(windows.size()));
         generation_ms += engine::debug::elapsed_ms(generation_start, Clock::now());
 
         const auto decoded = decode_events(tokenizer, last_ids);

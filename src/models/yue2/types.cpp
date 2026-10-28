@@ -29,6 +29,16 @@ Yue2CotMode parse_cot_mode(const std::string & value) {
     throw std::runtime_error("yue2.cot must be one of off, melody, or full");
 }
 
+Yue2AbcMode parse_abc_mode(const std::string & value) {
+    if (value == "strict") {
+        return Yue2AbcMode::Strict;
+    }
+    if (value == "seed" || value == "inspiration") {
+        return Yue2AbcMode::Seed;
+    }
+    throw std::runtime_error("yue2.abc_mode must be strict or seed");
+}
+
 const char * cot_instruction(Yue2CotMode mode) noexcept {
     switch (mode) {
         case Yue2CotMode::Off:

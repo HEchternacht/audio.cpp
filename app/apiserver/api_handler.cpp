@@ -250,11 +250,15 @@ void ApiHandler::run_job(Job & job, const std::shared_ptr<engine::runtime::RunCo
             } catch (const std::exception & ex) {
                 const std::string message = ex.what();
                 const bool out_of_memory = message.find("failed to allocate") != std::string::npos;
-                if (config_.unload_after_error || out_of_memory) {
+                // A cancel leaves by this door, not the one at the end of the
+                // function: `unload_after_cancel` has to be honoured here or it
+                // only ever worked because `unload_after_error` was also on.
+                const bool cancelled = control && control->cancelled();
+                if (config_.unload_after_error || out_of_memory ||
+                    (cancelled && config_.unload_after_cancel)) {
                     pool_.unload(job.model_id);
                 }
-                if (!out_of_memory || attempt >= config_.oom_retries ||
-                    (control && control->cancelled())) {
+                if (!out_of_memory || attempt >= config_.oom_retries || cancelled) {
                     throw;
                 }
                 // Halving the budget outright, rather than raising the memory
@@ -265,6 +269,19 @@ void ApiHandler::run_job(Job & job, const std::shared_ptr<engine::runtime::RunCo
                 // was worth: a run that overshot by a hundred megabytes came
                 // back a third of its length. Step down instead, and only fall
                 // to halves once a gentle step has already failed.
+                // A take forced into one window is the likeliest reason this
+                // missed, and no budget scale can rescue it: the window is the
+                // whole take by construction. Give that up first, once, before
+                // spending retries on a ladder that cannot reach.
+                auto forced = task_request.options.find("acoustic_single_window");
+                if (forced != task_request.options.end() && forced->second != "false") {
+                    forced->second = "false";
+                    job.resolved_options["acoustic_single_window"] = "false";
+                    std::cerr << "[api] job " << job.id
+                              << " ran out of device memory with a single acoustic window ("
+                              << message << "); retrying in chunks" << std::endl;
+                    continue;
+                }
                 scale = scale == 0.0 ? 0.75 : scale * 0.6;
                 task_request.options["vram_budget_scale"] = std::to_string(scale);
                 job.resolved_options["vram_budget_scale"] = std::to_string(scale);
@@ -439,6 +456,15 @@ HttpResponse ApiHandler::handle_capabilities(const HttpRequest &, const PathPara
             for (const char * stage : {"score", "semantic", "acoustic", "decode"}) {
                 stages.push_back(Value::make_string(stage));
             }
+            entry["progress_stages"] = Value::make_array(std::move(stages));
+        } else if (summary.family == "sheetsage2") {
+            entry["accepts_audio_input"] = Value::make_bool(true);
+            entry["notes"] = Value::make_string(
+                "sheetsage2 reads a score out of audio. It works through the recording in fixed "
+                "windows, so progress is reported per window rather than per token, and a "
+                "transcription of a few minutes takes a couple of minutes of its own.");
+            Value::Array stages;
+            stages.push_back(Value::make_string("transcribe"));
             entry["progress_stages"] = Value::make_array(std::move(stages));
         } else if (summary.family == "ace_step" || summary.family == "stable_audio") {
             entry["accepts_audio_input"] = Value::make_bool(true);

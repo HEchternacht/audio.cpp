@@ -238,11 +238,15 @@ int main() {
     }
 
     // A capped score must leave a song behind it. Uncapped, the 3948 tokens this
-    // card writes by default cost the acoustic stage 2.1 GiB on their own.
+    // card writes by default cost the acoustic stage 2.1 GiB on their own -- so
+    // there is a cap, but it sits at 2472 rather than 649, which is what the
+    // 640-token default was quietly rounding down to a cut-off score. It was
+    // 2984 while the overlap was 256: the score gives up exactly what the
+    // longer overlap takes, because both are acoustic prefix.
     {
         const int64_t score = yue2_score_tokens_for(budget_3492, 810);
         record("yue2_score_tokens_for", "the score a 20-second chunk floor allows",
-               std::to_string(score), "649");
+               std::to_string(score), "2472");
         // The cap exists to keep the chunk workable once the semantic stage has
         // taken its share, so that is what is checked: against the budget the
         // acoustic stage will actually see, the chunk is still at its floor.
@@ -258,11 +262,15 @@ int main() {
                               kYue2MinAcousticChunkTokens),
                "1");
         // The 3083-token score that sizing against the planner stage let through
-        // could not be prefilled by the acoustic stage at all.
-        record("yue2_score_tokens_for", "the score sized against the planner stage fit nothing",
+        // leaves a chunk, but a chunk below the floor -- eight seconds of music
+        // carrying ten of overlap. That is the trade the cap is drawn to refuse,
+        // and refusing it is not the same as the score fitting nothing: it read
+        // as nothing only while the NAR was being subtracted twice.
+        record("yue2_score_tokens_for", "a score past the cap leaves a chunk under the floor",
                std::to_string(yue2_acoustic_chunk_for(acoustic_budget, 810 + 3083,
-                                                      kYue2AcousticOverlapTokens)),
-               "0");
+                                                      kYue2AcousticOverlapTokens) <
+                              kYue2MinAcousticChunkTokens),
+               "1");
         record("yue2_score_tokens_for", "unmeasurable budget",
                std::to_string(yue2_score_tokens_for(0, 810)), "0");
     }
@@ -273,14 +281,17 @@ int main() {
     // minutes or ten.
     {
         const int64_t chunk = yue2_acoustic_chunk_for(budget_3492, 810, kYue2AcousticOverlapTokens);
-        record("yue2_acoustic_chunk_for", "cot=off, a 256-frame overlap",
-               std::to_string(chunk), "3675");
+        // 3675 at the old 256-frame overlap. The 441 frames given up are what
+        // the extra 512 frames of context cost at the prefix rate -- 17 seconds
+        // of chunk traded for 20 more seconds of memory across the seam.
+        record("yue2_acoustic_chunk_for", "cot=off, a 768-frame overlap",
+               std::to_string(chunk), "3234");
         // Zero means the prefix alone does not fit, which is not the same as
         // "no limit" -- and the caller that read it that way put a 7105-frame
         // take back into one piece and paged most of it to system RAM.
         record("yue2_acoustic_chunk_for", "zero is a refusal, not an absence of limit",
                std::to_string(yue2_acoustic_chunk_for(budget_3492 - kYue2SemanticRetentionTokens,
-                                                      3893, kYue2AcousticOverlapTokens)),
+                                                      4400, kYue2AcousticOverlapTokens)),
                "0");
         // The two takes that spilled both fit in one such chunk plus a second,
         // and neither needs shortening any more.
@@ -289,11 +300,22 @@ int main() {
         record("yue2_acoustic_chunk_for", "a chunk costs what the whole take used to",
                within(acoustic_mib(810 + kYue2AcousticOverlapTokens, chunk), 3236), "1");
         // A score is prefix at this stage too, so it shortens the chunk rather
-        // than the song -- the same trade, at a tenth the cost.
-        record("yue2_acoustic_chunk_for", "a 3948-token score shortens the chunk instead",
-               std::to_string(yue2_acoustic_chunk_for(budget_3492, 810 + 3948,
+        // than the song -- the same trade, at a tenth the cost. A score at the
+        // cap is the longest one that still leaves a chunk.
+        record("yue2_acoustic_chunk_for", "a capped score shortens the chunk instead",
+               std::to_string(yue2_acoustic_chunk_for(budget_3492, 810 + 2472,
                                                       kYue2AcousticOverlapTokens) > 0),
                "1");
+        // Past the cap there is no chunk left at all, where a 256-token overlap
+        // still found 278 -- eleven seconds of music carrying ten of overlap,
+        // which was never worth solving. The caller reads zero as "chunk at the
+        // floor and say it is spilling", so the honest outcome replaces a
+        // dishonest one; only a client-supplied score gets here, since the
+        // planner's own is capped at 2472.
+        record("yue2_acoustic_chunk_for", "a score past the cap leaves no chunk to shorten",
+               std::to_string(yue2_acoustic_chunk_for(budget_3492, 810 + 3948,
+                                                      kYue2AcousticOverlapTokens)),
+               "0");
         record("yue2_acoustic_chunk_for", "and a prefix that cannot fit at all admits no chunk",
                std::to_string(yue2_acoustic_chunk_for(12000, 60000, 256)), "0");
         record("yue2_acoustic_chunk_for", "unmeasurable budget",

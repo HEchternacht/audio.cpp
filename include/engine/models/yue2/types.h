@@ -68,12 +68,27 @@ struct Yue2GenerationConfig {
     // stage spends building its runtimes -- was not modelled at all, and even
     // 640 did not cover it. Now that it is charged explicitly, holding back
     // another 640 would charge it twice and cost half a minute of song.
-    // Raising this is still the lever a caller has when a run spills anyway.
-    int64_t vram_headroom_mb = 256;
+    // Raising this is still the lever a caller has when a run spills anyway --
+    // and at 100 that lever is the one to reach for first. This buys the longest
+    // score and the longest song the card will give, by holding back almost
+    // nothing for what the model does not price; a cot=full take that spills
+    // says so in its notes, and the answer is to raise this rather than to
+    // shorten anything.
+    int64_t vram_headroom_mb = 100;
     // Shrinks every window the budget allows, multiplicatively. 1.0 trusts the
     // estimate; a run that ran out of memory anyway is retried at 0.5, then
     // 0.25, which no amount of unaccounted overhead can defeat.
     double vram_budget_scale = 1.0;
+    // Solve the acoustic stage as one window, whatever the memory budget says.
+    //
+    // The budget sizes the chunk against free memory and splits a take that
+    // does not fit, carrying an overlap so the seams are not audible. That is
+    // the right default for a card that cannot hold a take whole -- but an
+    // overlap narrows a seam rather than removing it, and a caller who would
+    // rather pay for one window in speed than hear one has no way to say so.
+    // This is that way: the whole take in a single window, spilling to system
+    // RAM if it must, with the overflow named in the run's notes.
+    bool acoustic_single_window = false;
 };
 
 struct Yue2Config {
@@ -88,11 +103,25 @@ enum class Yue2CotMode {
     Full,
 };
 
+// What a supplied score is for.
+//
+// Strict closes the ABC block after the score, so the planner never runs and the
+// model sings exactly what it was given. Seed leaves the block open: the score
+// becomes the opening of the planner's own context, and the model carries on
+// writing it -- same key, same meter, same feel, because it is reading its own
+// prefix -- then sings the whole thing. That is the difference between handing
+// over an arrangement and handing over an idea.
+enum class Yue2AbcMode {
+    Strict,
+    Seed,
+};
+
 struct Yue2Request {
     std::string style;
     std::string lyrics;
     Yue2CotMode cot = Yue2CotMode::Full;
     std::string abc;
+    Yue2AbcMode abc_mode = Yue2AbcMode::Strict;
     std::vector<int32_t> semantic_codes;
     std::vector<float> nar_noise;
     uint64_t seed = 831001;
@@ -133,6 +162,7 @@ struct Yue2RunOutput {
 
 const char * cot_mode_name(Yue2CotMode mode) noexcept;
 Yue2CotMode parse_cot_mode(const std::string & value);
+Yue2AbcMode parse_abc_mode(const std::string & value);
 const char * cot_instruction(Yue2CotMode mode) noexcept;
 float request_guidance_scale(const Yue2Request & request) noexcept;
 

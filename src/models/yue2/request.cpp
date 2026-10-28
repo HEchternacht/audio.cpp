@@ -58,6 +58,9 @@ void apply_options(
     if (const auto cot = runtime::find_option(options, {"cot"})) {
         out.cot = parse_cot_mode(*cot);
     }
+    if (const auto abc_mode = runtime::find_option(options, {"abc_mode"})) {
+        out.abc_mode = parse_abc_mode(*abc_mode);
+    }
     if (const auto seed = runtime::parse_u64_option(options, {"seed"})) {
         out.seed = *seed;
     }
@@ -87,6 +90,10 @@ void apply_options(
     }
     out.generation.vram_headroom_mb =
         runtime::parse_positive_i64_option(options, {"vram_headroom_mb"}, out.generation.vram_headroom_mb);
+    if (const auto value = runtime::find_option(options, {"acoustic_single_window"})) {
+        out.generation.acoustic_single_window =
+            runtime::parse_bool_option(*value, "acoustic_single_window");
+    }
     if (const auto value = runtime::parse_finite_float_option(options, {"vram_budget_scale"})) {
         if (*value <= 0.0F || *value > 1.0F) {
             throw std::runtime_error("Yue2 vram_budget_scale must be in (0,1]");
